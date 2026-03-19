@@ -75,6 +75,9 @@ class TokenAnalyzer:
             return
         _analysis_cache[mint] = now
 
+        # Brief delay so RugCheck/Birdeye have time to index the new token
+        await asyncio.sleep(5)
+
         logger.info(f"[ANALYSIS] Analyzing {mint[:12]}... ({lead.get('symbol', '?')})")
         start = time.time()
 
@@ -84,7 +87,11 @@ class TokenAnalyzer:
         # --- 1. RugCheck ---
         rug_result = await self._check_rugcheck(mint)
         if not rug_result["safe"]:
-            logger.info(f"[ANALYSIS] REJECT {mint[:12]}: RugCheck failed — {rug_result['reason']}")
+            reason = rug_result["reason"]
+            if reason == "not_indexed_yet":
+                logger.debug(f"[ANALYSIS] SKIP {mint[:12]}: too new for RugCheck")
+            else:
+                logger.info(f"[ANALYSIS] REJECT {mint[:12]}: RugCheck failed — {reason}")
             return
         confidence += 35
         reasons.append("rug_ok")
@@ -166,6 +173,10 @@ class TokenAnalyzer:
                     # Rate limited — give benefit of doubt, log warning
                     logger.warning(f"[RUGCHECK] Rate limited for {mint[:12]}, skipping check")
                     return {"safe": True, "reason": "rate_limited"}
+                if resp.status == 400:
+                    # Token not yet indexed by RugCheck (too new) — skip it
+                    logger.debug(f"[RUGCHECK] Not indexed yet for {mint[:12]}, skipping")
+                    return {"safe": False, "reason": "not_indexed_yet"}
                 if resp.status != 200:
                     return {"safe": False, "reason": f"HTTP {resp.status}"}
 

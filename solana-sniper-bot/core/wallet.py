@@ -37,7 +37,8 @@ class WalletManager:
 
         self.pubkey: Pubkey = self.keypair.pubkey()
         self._rpc_url = HELIUS_RPC_URL
-        self.client = AsyncClient(self._rpc_url)
+        # commitment="confirmed" skips the /health preflight that Helius returns 404 on
+        self.client = AsyncClient(self._rpc_url, commitment="confirmed")
         logger.info(f"Wallet loaded: {self.pubkey} | Network: {NETWORK}")
 
     async def _ensure_client(self):
@@ -48,7 +49,7 @@ class WalletManager:
             logger.warning("Primary RPC unreachable, switching to fallback...")
             await self.client.close()
             self._rpc_url = FALLBACK_RPC_URL
-            self.client = AsyncClient(FALLBACK_RPC_URL)
+            self.client = AsyncClient(FALLBACK_RPC_URL, commitment="confirmed")
 
     async def get_sol_balance(self) -> float:
         """Returns SOL balance as a float."""
@@ -61,20 +62,31 @@ class WalletManager:
             return 0.0
 
     async def get_sol_price_usd(self) -> float:
-        """Fetches live SOL/USD price from Jupiter price API (free)."""
+        """Fetches live SOL/USD price. Tries multiple free sources with fallback."""
         import aiohttp
         global _SOL_PRICE_USD
-        try:
-            url = "https://price.jup.ag/v4/price?ids=SOL"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                    data = await r.json()
-                    price = data["data"]["SOL"]["price"]
-                    _SOL_PRICE_USD = float(price)
-                    return _SOL_PRICE_USD
-        except Exception as e:
-            logger.warning(f"Could not fetch SOL price, using cached ${_SOL_PRICE_USD}: {e}")
-            return _SOL_PRICE_USD
+        sources = [
+            # Binance (no key, very reliable)
+            ("https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT", "binance"),
+            # CoinGecko free (no key)
+            ("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", "coingecko"),
+        ]
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            for url, source in sources:
+                try:
+                    async with session.get(url) as r:
+                        if r.status != 200:
+                            continue
+                        data = await r.json()
+                        if source == "binance":
+                            _SOL_PRICE_USD = float(data["price"])
+                        elif source == "coingecko":
+                            _SOL_PRICE_USD = float(data["solana"]["usd"])
+                        return _SOL_PRICE_USD
+                except Exception:
+                    continue
+        logger.warning(f"All price sources failed, using cached ${_SOL_PRICE_USD}")
+        return _SOL_PRICE_USD
 
     async def get_balance_usd(self) -> float:
         sol = await self.get_sol_balance()

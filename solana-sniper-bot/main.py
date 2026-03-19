@@ -41,6 +41,9 @@ def setup_logging():
         logging.FileHandler(LOG_FILE, encoding="utf-8"),
     ]
     logging.basicConfig(level=level, format=fmt, handlers=handlers)
+    # Silence noisy third-party loggers
+    logging.getLogger("solanaweb3.rpc.httprpc.HTTPClient").setLevel(logging.CRITICAL)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
