@@ -38,11 +38,12 @@ class LaunchMonitor:
     # Public entry point
     # ------------------------------------------------------------------
     async def start(self):
-        """Launch both listeners concurrently."""
+        """Launch all listeners concurrently."""
         logger.info("[MONITOR] Starting dual-source monitor...")
         await asyncio.gather(
             self._pump_fun_listener(),
             self._raydium_listener(),
+            self._established_coin_scanner(),
         )
 
     # ------------------------------------------------------------------
@@ -184,6 +185,100 @@ class LaunchMonitor:
                 await self.queue.put(token_lead)
         except (KeyError, TypeError):
             pass
+
+    # ------------------------------------------------------------------
+    # 3. Established coin scanner (Dexscreener — free, no key)
+    #    Scans for coins $10k–$5M MC with strong momentum every 60s
+    # ------------------------------------------------------------------
+    async def _established_coin_scanner(self):
+        """
+        Polls Dexscreener for Solana tokens with:
+        - Market cap $10k–$5M
+        - Strong volume / price momentum
+        - Pushes as 'established' leads for 1:3 RR analysis
+        Runs every 60 seconds.
+        """
+        logger.info("[MONITOR] Established coin scanner starting...")
+        # Dexscreener trending + boosted endpoints (free)
+        SCAN_URLS = [
+            "https://api.dexscreener.com/token-boosts/top/v1",
+            "https://api.dexscreener.com/token-profiles/latest/v1",
+        ]
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as session:
+            while self._running:
+                for url in SCAN_URLS:
+                    try:
+                        async with session.get(url) as resp:
+                            if resp.status != 200:
+                                continue
+                            items = await resp.json()
+                            if not isinstance(items, list):
+                                continue
+                            for item in items:
+                                # Only Solana tokens
+                                if item.get("chainId") != "solana":
+                                    continue
+                                mint = item.get("tokenAddress", "")
+                                if not mint or len(mint) < 32:
+                                    continue
+                                lead = {
+                                    "source": "dexscreener_scan",
+                                    "type": "established",
+                                    "mint": mint,
+                                    "symbol": item.get("symbol", "?"),
+                                    "name": item.get("description", "?"),
+                                    "creator": "",
+                                    "url": item.get("url", ""),
+                                }
+                                await self.queue.put(lead)
+                    except Exception as e:
+                        logger.debug(f"[MONITOR] Established scanner error: {e}")
+
+                # Also scan Dexscreener search for high-volume Solana pairs
+                try:
+                    url = "https://api.dexscreener.com/latest/dex/search?q=solana"
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            pairs = data.get("pairs", [])
+                            for pair in pairs:
+                                if pair.get("chainId") != "solana":
+                                    continue
+                                fdv = float(pair.get("fdv", 0) or 0)
+                                vol_24h = float(pair.get("volume", {}).get("h24", 0) or 0)
+                                price_change_1h = float(pair.get("priceChange", {}).get("h1", 0) or 0)
+                                # Filter: $10k–$5M MC, >$50k 24h volume, >20% 1h move
+                                if not (10_000 <= fdv <= 5_000_000):
+                                    continue
+                                if vol_24h < 50_000:
+                                    continue
+                                if price_change_1h < 20:
+                                    continue
+                                mint = pair.get("baseToken", {}).get("address", "")
+                                if not mint or len(mint) < 32:
+                                    continue
+                                lead = {
+                                    "source": "dexscreener_scan",
+                                    "type": "established",
+                                    "mint": mint,
+                                    "symbol": pair.get("baseToken", {}).get("symbol", "?"),
+                                    "name": pair.get("baseToken", {}).get("name", "?"),
+                                    "creator": "",
+                                    "market_cap_usd": fdv,
+                                    "volume_24h": vol_24h,
+                                    "price_change_1h": price_change_1h,
+                                }
+                                await self.queue.put(lead)
+                                logger.debug(
+                                    f"[MONITOR] Established coin: {lead['symbol']} "
+                                    f"MC=${fdv:,.0f} vol=${vol_24h:,.0f} +{price_change_1h:.0f}%/1h"
+                                )
+                except Exception as e:
+                    logger.debug(f"[MONITOR] Dexscreener search error: {e}")
+
+                await asyncio.sleep(60)  # scan every 60 seconds
 
     def stop(self):
         self._running = False

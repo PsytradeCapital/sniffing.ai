@@ -76,7 +76,9 @@ class TokenAnalyzer:
         _analysis_cache[mint] = now
 
         # Brief delay so RugCheck/Birdeye have time to index the new token
-        await asyncio.sleep(5)
+        # Established coins skip this — they're already indexed
+        if lead.get("type") != "established":
+            await asyncio.sleep(5)
 
         logger.info(f"[ANALYSIS] Analyzing {mint[:12]}... ({lead.get('symbol', '?')})")
         start = time.time()
@@ -118,6 +120,9 @@ class TokenAnalyzer:
         reasons.append("liquidity_ok")
 
         is_new_coin = market["market_cap_usd"] < NEW_COIN_MC_THRESHOLD
+        # Established leads from scanner are never "new coins"
+        if lead.get("type") == "established":
+            is_new_coin = False
 
         # --- 4. Momentum ---
         momentum_score = await self._check_momentum(mint, market)
