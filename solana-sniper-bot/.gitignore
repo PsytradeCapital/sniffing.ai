@@ -1,0 +1,23 @@
+# CRITICAL: Never expose secrets
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Logs & Data
+data/logs/*.log
+data/logs/*.json
+*.log
+
+# IDE
+.vscode/
+.idea/
