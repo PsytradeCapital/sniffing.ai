@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  solana_sniper:
+    build: .
+    container_name: solana_sniper_bot
+    env_file: .env
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # health check endpoint
+    volumes:
+      - ./data/logs:/app/data/logs   # persist logs outside container
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"

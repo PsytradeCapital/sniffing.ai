@@ -22,6 +22,13 @@ HELIUS_WSS_URL: str = os.getenv("HELIUS_WSS_URL", "wss://api.devnet.solana.com")
 FALLBACK_RPC_URL: str = os.getenv("FALLBACK_RPC_URL", "https://api.devnet.solana.com")
 FALLBACK_WSS_URL: str = os.getenv("FALLBACK_WSS_URL", "wss://api.devnet.solana.com")
 
+# Mainnet public fallback (auto-selected when NETWORK=mainnet and no Helius key)
+_MAINNET_FALLBACK_RPC = "https://api.mainnet-beta.solana.com"
+_MAINNET_FALLBACK_WSS = "wss://api.mainnet-beta.solana.com"
+if NETWORK == "mainnet" and "devnet" in FALLBACK_RPC_URL:
+    FALLBACK_RPC_URL = _MAINNET_FALLBACK_RPC
+    FALLBACK_WSS_URL = _MAINNET_FALLBACK_WSS
+
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
@@ -93,7 +100,8 @@ TIME_STOP_MINUTES: int = 30
 # Safety Limits
 # ---------------------------------------------------------------------------
 MAX_DAILY_LOSS_PCT: float = 0.30   # halt trading if down 30% on the day
-EMERGENCY_SELL_ALL: bool = False   # set True to liquidate all positions
+# Set EMERGENCY_SELL_ALL=True in .env OR flip at runtime to liquidate all positions instantly
+EMERGENCY_SELL_ALL: bool = os.getenv("EMERGENCY_SELL_ALL", "False").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Priority Fees (SOL) for fast transaction landing

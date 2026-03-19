@@ -13,10 +13,13 @@ trade_executor.py — Jupiter V6 buy/sell execution with:
 import asyncio
 import base64
 import logging
+import os
 import time
 from typing import Optional
 
 import aiohttp
+from solana.rpc.types import TxOpts
+from solders.transaction import VersionedTransaction
 
 from core.config import (
     JUPITER_API, PAPER_TRADE, SOL_MINT,
@@ -72,6 +75,8 @@ class TradeExecutor:
         self._last_trade_time: float = 0
         self._daily_start_balance: float = 0
         self._daily_pnl_sol: float = 0
+        # Optional async callback: notify(msg: str) — set by main.py
+        self.notify = None  # type: Optional[callable]
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -91,7 +96,7 @@ class TradeExecutor:
         confidence = signal.get("confidence", 75)
 
         # --- Guards ---
-        if EMERGENCY_SELL_ALL:
+        if os.getenv("EMERGENCY_SELL_ALL", "False").lower() == "true":
             logger.warning("[EXECUTOR] Emergency sell-all active. No new buys.")
             return
 
@@ -189,15 +194,15 @@ class TradeExecutor:
                 return
 
             # Step 3: Sign and send
-            from solders.transaction import VersionedTransaction
+            # solders VersionedTransaction: reconstruct with signed message
             raw_bytes = base64.b64decode(swap_data["swapTransaction"])
-            tx = VersionedTransaction.from_bytes(raw_bytes)
-            signed_tx = VersionedTransaction(tx.message, [self.wallet.keypair])
+            unsigned_tx = VersionedTransaction.from_bytes(raw_bytes)
+            signed_tx = VersionedTransaction(unsigned_tx.message, [self.wallet.keypair])
             tx_bytes = bytes(signed_tx)
 
             send_resp = await self.wallet.client.send_raw_transaction(
                 tx_bytes,
-                opts={"skipPreflight": True, "maxRetries": 3}
+                opts=TxOpts(skip_preflight=True, max_retries=3),
             )
             sig = send_resp.value
             logger.info(f"[EXECUTOR] ✅ BUY sent: {symbol} | tx={sig} | {size_sol:.4f} SOL")
@@ -233,6 +238,12 @@ class TradeExecutor:
             pos.remaining_pct -= sell_pct
             if pos.remaining_pct <= 0.01:
                 del self.open_positions[mint]
+            # Fire Telegram alert on notable exits
+            if self.notify and abs(pnl) >= 50:
+                emoji = "🚀" if pnl > 0 else "🔴"
+                asyncio.create_task(self.notify(
+                    f"{emoji} {symbol} SELL ({reason}) | P&L: {pnl:+.1f}%"
+                ))
             return
 
         # Real sell via Jupiter
@@ -264,13 +275,12 @@ class TradeExecutor:
             async with session.post(f"{JUPITER_API}/swap", json=swap_payload) as resp:
                 swap_data = await resp.json()
 
-            from solders.transaction import VersionedTransaction
             raw_bytes = base64.b64decode(swap_data["swapTransaction"])
-            tx = VersionedTransaction.from_bytes(raw_bytes)
-            signed_tx = VersionedTransaction(tx.message, [self.wallet.keypair])
+            unsigned_tx = VersionedTransaction.from_bytes(raw_bytes)
+            signed_tx = VersionedTransaction(unsigned_tx.message, [self.wallet.keypair])
             send_resp = await self.wallet.client.send_raw_transaction(
                 bytes(signed_tx),
-                opts={"skipPreflight": True, "maxRetries": 3}
+                opts=TxOpts(skip_preflight=True, max_retries=3),
             )
             logger.info(f"[EXECUTOR] ✅ SELL {symbol} | reason={reason} | tx={send_resp.value}")
 
@@ -287,10 +297,16 @@ class TradeExecutor:
     async def manage_positions(self):
         """
         Runs every 5 seconds. Updates prices, checks TP/SL/trailing/time stops.
+        Re-reads EMERGENCY_SELL_ALL from env at runtime so it can be toggled
+        without restarting the bot (set EMERGENCY_SELL_ALL=True in .env and
+        send SIGHUP, or just restart — the flag is checked every 5s).
         """
         while True:
             try:
-                if EMERGENCY_SELL_ALL and self.open_positions:
+                # Re-read at runtime so env changes take effect without restart
+                emergency = os.getenv("EMERGENCY_SELL_ALL", "False").lower() == "true"
+
+                if emergency and self.open_positions:
                     logger.warning("[EXECUTOR] EMERGENCY SELL ALL triggered!")
                     for mint in list(self.open_positions.keys()):
                         await self.execute_sell(mint, "emergency_sell_all")

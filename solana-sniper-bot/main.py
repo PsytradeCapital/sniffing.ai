@@ -7,22 +7,20 @@ Pipeline: Monitor → Analysis Queue → Analyzer → Trade Queue → Executor
          + Auto-restart on crash
          + Daily loss limit + emergency sell
          + Telegram alerts (optional)
-         + Gradual lot-size scaling as balance grows
 """
 import asyncio
 import logging
-import signal
 import sys
 import time
-from datetime import datetime, date
+from datetime import date
 
 import aiohttp
-from colorama import Fore, Style, init
+from colorama import Fore, init
 
 from core.config import (
     PAPER_TRADE, AGGRESSIVE_MODE, MIN_DEPOSIT_MODE,
     MAX_DAILY_LOSS_PCT, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    LOG_FILE, LOG_LEVEL,
+    LOG_FILE, LOG_LEVEL, EMERGENCY_SELL_ALL,
 )
 from core.wallet import WalletManager
 from modules.monitor import LaunchMonitor
@@ -30,6 +28,7 @@ from modules.analysis import TokenAnalyzer
 from modules.trade_executor import TradeExecutor
 
 init(autoreset=True)
+
 
 # ---------------------------------------------------------------------------
 # Logging — file + console
@@ -53,7 +52,11 @@ async def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         async with aiohttp.ClientSession() as s:
-            await s.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=aiohttp.ClientTimeout(total=5))
+            await s.post(
+                url,
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+                timeout=aiohttp.ClientTimeout(total=5),
+            )
     except Exception:
         pass
 
@@ -62,37 +65,41 @@ async def send_telegram(msg: str):
 # Queue processors
 # ---------------------------------------------------------------------------
 async def analysis_worker(analyzer: TokenAnalyzer, analysis_queue: asyncio.Queue):
-    """Drains analysis queue — runs analysis on each lead."""
-    logger = logging.getLogger("analysis_worker")
+    """Drains analysis queue — spawns a non-blocking task per lead."""
+    log = logging.getLogger("analysis_worker")
     while True:
         try:
             lead = await analysis_queue.get()
-            asyncio.create_task(analyzer.analyze(lead))  # non-blocking per-token
+            asyncio.create_task(analyzer.analyze(lead))
             analysis_queue.task_done()
         except Exception as e:
-            logger.error(f"Analysis worker error: {e}")
+            log.error(f"Analysis worker error: {e}")
 
 
 async def trade_worker(executor: TradeExecutor, trade_queue: asyncio.Queue):
-    """Drains trade queue — executes buys."""
-    logger = logging.getLogger("trade_worker")
+    """Drains trade queue — executes buys sequentially."""
+    log = logging.getLogger("trade_worker")
     while True:
         try:
-            signal = await trade_queue.get()
-            await executor.execute_buy(signal)
+            signal_data = await trade_queue.get()
+            await executor.execute_buy(signal_data)
             trade_queue.task_done()
         except Exception as e:
-            logger.error(f"Trade worker error: {e}")
+            log.error(f"Trade worker error: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Dashboard
+# Console dashboard
 # ---------------------------------------------------------------------------
-async def dashboard(wallet: WalletManager, executor: TradeExecutor,
-                    analysis_queue: asyncio.Queue, trade_queue: asyncio.Queue,
-                    start_time: float):
-    logger = logging.getLogger("dashboard")
-    daily_start_bal: float = 0
+async def dashboard(
+    wallet: WalletManager,
+    executor: TradeExecutor,
+    analysis_queue: asyncio.Queue,
+    trade_queue: asyncio.Queue,
+    start_time: float,
+):
+    log = logging.getLogger("dashboard")
+    daily_start_bal: float = 0.0
     last_summary_date = date.today()
 
     while True:
@@ -104,4 +111,155 @@ async def dashboard(wallet: WalletManager, executor: TradeExecutor,
             if daily_start_bal == 0:
                 daily_start_bal = bal
 
-            pn
+            daily_pnl_sol = bal - daily_start_bal
+            daily_pnl_pct = (daily_pnl_sol / daily_start_bal * 100) if daily_start_bal else 0
+            uptime_h = (time.time() - start_time) / 3600
+
+            pnl_color = Fore.GREEN if daily_pnl_sol >= 0 else Fore.RED
+            mode_tag = "[PAPER]" if PAPER_TRADE else "[LIVE]"
+            mode_color = Fore.YELLOW if PAPER_TRADE else Fore.RED
+
+            print("\n" + "=" * 52)
+            print(Fore.CYAN + f"  🦅  SOLANA SNIPER BOT  {mode_color}{mode_tag}")
+            print("=" * 52)
+            print(Fore.WHITE + f"  Balance   : {bal:.4f} SOL  (${bal_usd:.2f})")
+            print(pnl_color  + f"  Daily P&L : {daily_pnl_sol:+.4f} SOL  ({daily_pnl_pct:+.1f}%)")
+            print(Fore.WHITE + f"  Positions : {len(executor.open_positions)} / 3")
+            print(Fore.WHITE + f"  Queues    : analysis={analysis_queue.qsize()}  trade={trade_queue.qsize()}")
+            print(Fore.WHITE + f"  Uptime    : {uptime_h:.1f}h")
+            print(Fore.WHITE + f"  Network   : {'AGGRESSIVE' if AGGRESSIVE_MODE else 'NORMAL'} | MIN_DEPOSIT={MIN_DEPOSIT_MODE}")
+
+            # Print open positions
+            if executor.open_positions:
+                print(Fore.CYAN + "\n  Open Positions:")
+                for mint, pos in executor.open_positions.items():
+                    pnl = pos.profit_pct * 100
+                    c = Fore.GREEN if pnl >= 0 else Fore.RED
+                    print(c + f"    {pos.symbol:10s} | P&L: {pnl:+.1f}% | age: {pos.age_minutes:.0f}m | trailing: {pos.trailing_active}")
+
+            print("=" * 52 + "\n")
+
+            # Daily summary (once per day)
+            today = date.today()
+            if today != last_summary_date:
+                summary = (
+                    f"📊 Daily Summary\n"
+                    f"P&L: {daily_pnl_sol:+.4f} SOL ({daily_pnl_pct:+.1f}%)\n"
+                    f"Balance: {bal:.4f} SOL"
+                )
+                await send_telegram(summary)
+                log.info(summary)
+                daily_start_bal = bal
+                last_summary_date = today
+
+            # Telegram alert on big daily loss
+            if daily_pnl_pct <= -(MAX_DAILY_LOSS_PCT * 100 * 0.8):
+                await send_telegram(f"⚠️ WARNING: Daily loss at {daily_pnl_pct:.1f}% — approaching limit!")
+
+            # Telegram alert on big daily win (>50% up on the day)
+            if daily_pnl_pct >= 50:
+                await send_telegram(f"🚀 BIG WIN: Daily P&L at +{daily_pnl_pct:.1f}% ({daily_pnl_sol:+.4f} SOL)!")
+
+        except Exception as e:
+            log.error(f"Dashboard error: {e}")
+
+        await asyncio.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# Health check HTTP endpoint (for Replit / Render uptime pings)
+# ---------------------------------------------------------------------------
+async def health_server():
+    """Tiny HTTP server on port 8080 so uptime monitors can ping it."""
+    from aiohttp import web
+
+    async def handle(_request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", handle)
+    app.router.add_get("/health", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+    logging.getLogger("health").info("Health server running on :8080")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+async def main():
+    setup_logging()
+    log = logging.getLogger("main")
+    start_time = time.time()
+
+    log.info("=" * 52)
+    log.info("  Solana Sniper Bot — Starting up")
+    log.info(f"  Mode: {'PAPER TRADE' if PAPER_TRADE else '🔴 LIVE TRADING'}")
+    log.info(f"  Min deposit mode: {MIN_DEPOSIT_MODE}")
+    log.info("=" * 52)
+
+    await send_telegram("🚀 Solana Sniper Bot started!")
+
+    # Init wallet
+    wallet = WalletManager()
+    bal = await wallet.get_sol_balance()
+    price = await wallet.get_sol_price_usd()
+    log.info(f"Wallet: {wallet.pubkey} | Balance: {bal:.4f} SOL (${bal * price:.2f})")
+
+    if bal < 0.001 and not PAPER_TRADE:
+        log.error("Wallet balance too low for live trading. Fund wallet or enable PAPER_TRADE_MODE=True")
+        await wallet.close()
+        return
+
+    # Queues
+    analysis_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+    trade_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+
+    # Modules
+    monitor = LaunchMonitor(analysis_queue)
+    analyzer = TokenAnalyzer(trade_queue)
+    executor = TradeExecutor(wallet)
+    executor.notify = send_telegram  # wire Telegram alerts for big wins/losses
+
+    # Spawn all tasks
+    tasks = [
+        asyncio.create_task(monitor.start(), name="monitor"),
+        asyncio.create_task(analysis_worker(analyzer, analysis_queue), name="analysis_worker"),
+        asyncio.create_task(trade_worker(executor, trade_queue), name="trade_worker"),
+        asyncio.create_task(executor.manage_positions(), name="position_manager"),
+        asyncio.create_task(dashboard(wallet, executor, analysis_queue, trade_queue, start_time), name="dashboard"),
+        asyncio.create_task(health_server(), name="health"),
+    ]
+
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        log.info("Tasks cancelled — shutting down.")
+    finally:
+        monitor.stop()
+        await analyzer.close()
+        await executor.close()
+        await wallet.close()
+        log.info("Bot shut down cleanly.")
+        await send_telegram("🛑 Solana Sniper Bot stopped.")
+
+
+# ---------------------------------------------------------------------------
+# Entry point with auto-restart on crash
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    log = logging.getLogger("main")
+    RESTART_DELAY = 10  # seconds between crash restarts
+
+    while True:
+        try:
+            asyncio.run(main())
+            break  # clean exit (KeyboardInterrupt propagates below)
+        except KeyboardInterrupt:
+            print("\nBot stopped by user.")
+            break
+        except Exception as e:
+            print(f"[CRASH] Bot crashed: {e}. Restarting in {RESTART_DELAY}s...")
+            time.sleep(RESTART_DELAY)
