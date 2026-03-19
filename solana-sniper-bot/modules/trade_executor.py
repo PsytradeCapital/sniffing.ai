@@ -131,11 +131,13 @@ class TradeExecutor:
     async def _calculate_position_size(self, confidence: int) -> float:
         """Scale position size with wallet balance and confidence."""
         balance = await self.wallet.get_sol_balance()
-        # Scale risk % with confidence (75→1%, 100→5%)
+        # If balance is 0 (devnet/unfunded), use base size for paper trading
+        if balance < BASE_POSITION_SIZE_SOL:
+            return BASE_POSITION_SIZE_SOL
+        # Scale risk % with confidence (75→2%, 100→5%)
         risk_pct = RISK_PCT_NORMAL + (confidence - 75) / 25 * (RISK_PCT_MAX - RISK_PCT_NORMAL)
         risk_pct = min(risk_pct, RISK_PCT_MAX)
         size = max(balance * risk_pct, BASE_POSITION_SIZE_SOL)
-        # Never risk more than 5% of balance
         size = min(size, balance * RISK_PCT_MAX)
         return round(size, 6)
 

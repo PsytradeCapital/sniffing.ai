@@ -233,6 +233,7 @@ class LaunchMonitor:
                                     "url": item.get("url", ""),
                                 }
                                 await self.queue.put(lead)
+                                await asyncio.sleep(0.5)  # throttle RugCheck
                     except Exception as e:
                         logger.debug(f"[MONITOR] Established scanner error: {e}")
 
@@ -271,6 +272,7 @@ class LaunchMonitor:
                                     "price_change_1h": price_change_1h,
                                 }
                                 await self.queue.put(lead)
+                                await asyncio.sleep(0.5)  # throttle RugCheck
                                 logger.debug(
                                     f"[MONITOR] Established coin: {lead['symbol']} "
                                     f"MC=${fdv:,.0f} vol=${vol_24h:,.0f} +{price_change_1h:.0f}%/1h"

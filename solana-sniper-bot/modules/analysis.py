@@ -79,6 +79,9 @@ class TokenAnalyzer:
         # Established coins skip this — they're already indexed
         if lead.get("type") != "established":
             await asyncio.sleep(5)
+        else:
+            # Stagger established coin checks to avoid RugCheck rate limits
+            await asyncio.sleep(2)
 
         logger.info(f"[ANALYSIS] Analyzing {mint[:12]}... ({lead.get('symbol', '?')})")
         start = time.time()
@@ -124,6 +127,10 @@ class TokenAnalyzer:
         if lead.get("type") == "established":
             is_new_coin = False
 
+        # Established coins have a lower confidence threshold (already proven tokens)
+        # New coins need higher conviction before entry
+        required_score = MIN_CONFIDENCE_SCORE if is_new_coin else 60
+
         # --- 4. Momentum ---
         momentum_score = await self._check_momentum(mint, market)
         if momentum_score == 0:
@@ -144,7 +151,7 @@ class TokenAnalyzer:
             f"new={is_new_coin} | {elapsed:.2f}s | {', '.join(reasons)}"
         )
 
-        if confidence >= MIN_CONFIDENCE_SCORE:
+        if confidence >= required_score:
             signal = {
                 "mint": mint,
                 "symbol": lead.get("symbol", "?"),
@@ -158,7 +165,7 @@ class TokenAnalyzer:
             logger.info(f"[ANALYSIS] ✅ PASS {mint[:12]} | confidence={confidence}")
             await self.trade_queue.put(signal)
         else:
-            logger.info(f"[ANALYSIS] REJECT {mint[:12]}: Score {confidence} < {MIN_CONFIDENCE_SCORE}")
+            logger.info(f"[ANALYSIS] REJECT {mint[:12]}: Score {confidence} < {required_score}")
 
     # ------------------------------------------------------------------
     # Check 1: RugCheck.xyz (free API)
