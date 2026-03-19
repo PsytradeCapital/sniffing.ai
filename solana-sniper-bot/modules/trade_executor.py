@@ -75,6 +75,8 @@ class TradeExecutor:
         self._last_trade_time: float = 0
         self._daily_start_balance: float = 0
         self._daily_pnl_sol: float = 0
+        # Per-source cooldown: new launches and established coins don't block each other
+        self._last_trade_time_by_source: dict = {}
         # Optional async callback: notify(msg: str) — set by main.py
         self.notify = None  # type: Optional[callable]
 
@@ -108,9 +110,13 @@ class TradeExecutor:
             logger.info(f"[EXECUTOR] Already in position for {symbol}. Skipping.")
             return
 
-        cooldown_remaining = TRADE_COOLDOWN_SECONDS - (time.time() - self._last_trade_time)
+        cooldown_remaining = TRADE_COOLDOWN_SECONDS - (
+            time.time() - self._last_trade_time_by_source.get(
+                signal.get("source", "unknown"), 0
+            )
+        )
         if cooldown_remaining > 0:
-            logger.info(f"[EXECUTOR] Cooldown active ({cooldown_remaining:.0f}s). Skipping {symbol}.")
+            logger.info(f"[EXECUTOR] Cooldown active ({cooldown_remaining:.0f}s) for source={signal.get('source')}. Skipping {symbol}.")
             return
 
         # --- Daily loss limit ---
@@ -120,13 +126,14 @@ class TradeExecutor:
 
         # --- Position sizing ---
         size_sol = await self._calculate_position_size(confidence)
+        source = signal.get("source", "unknown")
         logger.info(f"[EXECUTOR] BUY signal: {symbol} ({mint[:12]}...) | size={size_sol:.4f} SOL | conf={confidence}")
 
         if PAPER_TRADE:
-            await self._paper_buy(mint, symbol, size_sol, is_new)
+            await self._paper_buy(mint, symbol, size_sol, is_new, source)
             return
 
-        await self._real_buy(mint, symbol, size_sol, is_new, confidence)
+        await self._real_buy(mint, symbol, size_sol, is_new, confidence, source)
 
     async def _calculate_position_size(self, confidence: int) -> float:
         """Scale position size with wallet balance and confidence."""
@@ -141,18 +148,19 @@ class TradeExecutor:
         size = min(size, balance * RISK_PCT_MAX)
         return round(size, 6)
 
-    async def _paper_buy(self, mint: str, symbol: str, size_sol: float, is_new: bool):
-        mock_price = 0.000001  # placeholder entry price
+    async def _paper_buy(self, mint: str, symbol: str, size_sol: float, is_new: bool, source: str = "unknown"):
+        mock_price = 0.000001
         pos = Position(mint, symbol, mock_price, size_sol, is_new)
         self.open_positions[mint] = pos
         self._last_trade_time = time.time()
+        self._last_trade_time_by_source[source] = time.time()
         logger.info(
             f"[PAPER] BUY {size_sol:.4f} SOL of {symbol} @ ${mock_price:.8f} | "
             f"target={'10x' if is_new else '3x'}"
         )
 
     async def _real_buy(self, mint: str, symbol: str, size_sol: float,
-                        is_new: bool, confidence: int):
+                        is_new: bool, confidence: int, source: str = "unknown"):
         """Execute real buy via Jupiter V6 swap API."""
         session = await self._get_session()
         lamports = self.wallet.sol_to_lamports(size_sol)
@@ -215,6 +223,7 @@ class TradeExecutor:
             pos = Position(mint, symbol, entry_price, size_sol, is_new)
             self.open_positions[mint] = pos
             self._last_trade_time = time.time()
+            self._last_trade_time_by_source[source] = time.time()
 
         except Exception as e:
             logger.error(f"[EXECUTOR] Buy failed for {symbol}: {e}")

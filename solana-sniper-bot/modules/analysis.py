@@ -154,7 +154,7 @@ class TokenAnalyzer:
         if confidence >= required_score:
             signal = {
                 "mint": mint,
-                "symbol": lead.get("symbol", "?"),
+                "symbol": (lead.get("symbol") or "").strip("?").strip() or mint[:8],
                 "name": lead.get("name", "?"),
                 "is_new_coin": is_new_coin,
                 "market_cap_usd": market["market_cap_usd"],
