@@ -90,8 +90,8 @@ PARTIAL_TP_PCT: float = 0.33                   # portion to sell at each level
 
 # Stop-loss
 HARD_STOP_LOSS_PCT: float = -0.20             # -20% hard cut
-TRAILING_STOP_TRIGGER_PCT: float = 0.50       # start trailing after +50%
-TRAILING_STOP_DISTANCE_PCT: float = 0.15      # trail 15% below high-water mark
+TRAILING_STOP_TRIGGER_PCT: float = 0.20       # start trailing after +20%
+TRAILING_STOP_DISTANCE_PCT: float = 0.10      # trail 10% below high-water mark
 
 # Time-based stop: exit if no movement after N minutes
 TIME_STOP_MINUTES: int = 30

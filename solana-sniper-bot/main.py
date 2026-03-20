@@ -20,7 +20,7 @@ from colorama import Fore, init
 from core.config import (
     PAPER_TRADE, AGGRESSIVE_MODE, MIN_DEPOSIT_MODE,
     MAX_DAILY_LOSS_PCT, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    LOG_FILE, LOG_LEVEL, EMERGENCY_SELL_ALL,
+    LOG_FILE, LOG_LEVEL, EMERGENCY_SELL_ALL, MAX_OPEN_POSITIONS,
 )
 from core.wallet import WalletManager
 from modules.monitor import LaunchMonitor
@@ -114,8 +114,15 @@ async def dashboard(
             if daily_start_bal == 0:
                 daily_start_bal = bal
 
-            daily_pnl_sol = bal - daily_start_bal
-            daily_pnl_pct = (daily_pnl_sol / daily_start_bal * 100) if daily_start_bal else 0
+            # In paper mode, P&L comes from realized paper trades (balance doesn't change)
+            if PAPER_TRADE:
+                daily_pnl_sol = executor._paper_pnl_sol
+                daily_pnl_pct = (daily_pnl_sol / daily_start_bal * 100) if daily_start_bal else 0
+                simulated_bal = daily_start_bal + daily_pnl_sol
+            else:
+                daily_pnl_sol = bal - daily_start_bal
+                daily_pnl_pct = (daily_pnl_sol / daily_start_bal * 100) if daily_start_bal else 0
+                simulated_bal = bal
             uptime_h = (time.time() - start_time) / 3600
 
             pnl_color = Fore.GREEN if daily_pnl_sol >= 0 else Fore.RED
@@ -125,9 +132,13 @@ async def dashboard(
             print("\n" + "=" * 52)
             print(Fore.CYAN + f"  🦅  SOLANA SNIPER BOT  {mode_color}{mode_tag}")
             print("=" * 52)
-            print(Fore.WHITE + f"  Balance   : {bal:.4f} SOL  (${bal_usd:.2f})")
+            if PAPER_TRADE:
+                print(Fore.WHITE + f"  Real Balance  : {bal:.4f} SOL  (${bal_usd:.2f})")
+                print(Fore.YELLOW + f"  Paper Balance : {simulated_bal:.4f} SOL  (${simulated_bal * price:.2f})")
+            else:
+                print(Fore.WHITE + f"  Balance   : {bal:.4f} SOL  (${bal_usd:.2f})")
             print(pnl_color  + f"  Daily P&L : {daily_pnl_sol:+.4f} SOL  ({daily_pnl_pct:+.1f}%)")
-            print(Fore.WHITE + f"  Positions : {len(executor.open_positions)} / 3")
+            print(Fore.WHITE + f"  Positions : {len(executor.open_positions)} / {MAX_OPEN_POSITIONS}")
             print(Fore.WHITE + f"  Queues    : analysis={analysis_queue.qsize()}  trade={trade_queue.qsize()}")
             print(Fore.WHITE + f"  Uptime    : {uptime_h:.1f}h")
             print(Fore.WHITE + f"  Network   : {'AGGRESSIVE' if AGGRESSIVE_MODE else 'NORMAL'} | MIN_DEPOSIT={MIN_DEPOSIT_MODE}")
@@ -152,7 +163,10 @@ async def dashboard(
                 )
                 await send_telegram(summary)
                 log.info(summary)
-                daily_start_bal = bal
+                if PAPER_TRADE:
+                    executor._paper_pnl_sol = 0.0
+                else:
+                    daily_start_bal = bal
                 last_summary_date = today
 
             # Telegram alert on big daily loss

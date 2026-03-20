@@ -75,6 +75,7 @@ class TradeExecutor:
         self._last_trade_time: float = 0
         self._daily_start_balance: float = 0
         self._daily_pnl_sol: float = 0
+        self._paper_pnl_sol: float = 0.0   # accumulated paper trade realized P&L
         # Per-source cooldown: new launches and established coins don't block each other
         self._last_trade_time_by_source: dict = {}
         # Optional async callback: notify(msg: str) — set by main.py
@@ -149,13 +150,15 @@ class TradeExecutor:
         return round(size, 6)
 
     async def _paper_buy(self, mint: str, symbol: str, size_sol: float, is_new: bool, source: str = "unknown"):
-        mock_price = 0.000001
-        pos = Position(mint, symbol, mock_price, size_sol, is_new)
+        # Fetch real current price for accurate paper trade simulation
+        real_price = await self._get_current_price(mint)
+        entry_price = real_price if real_price and real_price > 0 else 0.000001
+        pos = Position(mint, symbol, entry_price, size_sol, is_new)
         self.open_positions[mint] = pos
         self._last_trade_time = time.time()
         self._last_trade_time_by_source[source] = time.time()
         logger.info(
-            f"[PAPER] BUY {size_sol:.4f} SOL of {symbol} @ ${mock_price:.8f} | "
+            f"[PAPER] BUY {size_sol:.4f} SOL of {symbol} @ ${entry_price:.8f} | "
             f"target={'10x' if is_new else '3x'}"
         )
 
@@ -241,19 +244,22 @@ class TradeExecutor:
         symbol = pos.symbol
 
         if PAPER_TRADE:
-            pnl = (pos.current_price - pos.entry_price) / pos.entry_price * 100
+            pnl_pct = (pos.current_price - pos.entry_price) / pos.entry_price * 100 if pos.entry_price else 0
+            # Realized P&L in SOL for this partial/full sell
+            realized_sol = pos.size_sol * sell_pct * (pnl_pct / 100)
+            self._paper_pnl_sol += realized_sol
             logger.info(
                 f"[PAPER] SELL {sell_pct*100:.0f}% of {symbol} | "
-                f"reason={reason} | P&L={pnl:+.1f}%"
+                f"reason={reason} | P&L={pnl_pct:+.1f}% | realized={realized_sol:+.4f} SOL"
             )
             pos.remaining_pct -= sell_pct
             if pos.remaining_pct <= 0.01:
                 del self.open_positions[mint]
             # Fire Telegram alert on notable exits
-            if self.notify and abs(pnl) >= 50:
-                emoji = "🚀" if pnl > 0 else "🔴"
+            if self.notify and abs(pnl_pct) >= 50:
+                emoji = "🚀" if pnl_pct > 0 else "🔴"
                 asyncio.create_task(self.notify(
-                    f"{emoji} {symbol} SELL ({reason}) | P&L: {pnl:+.1f}%"
+                    f"{emoji} {symbol} SELL ({reason}) | P&L: {pnl_pct:+.1f}% | {realized_sol:+.4f} SOL"
                 ))
             return
 

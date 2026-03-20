@@ -26,6 +26,9 @@ from core.config import (
 
 logger = logging.getLogger(__name__)
 
+# Limit concurrent RugCheck requests to avoid rate limits and timeouts
+_rugcheck_semaphore = asyncio.Semaphore(3)
+
 # Simple in-memory cache to avoid re-analyzing the same mint within 60s
 _analysis_cache: dict[str, float] = {}
 CACHE_TTL = 60  # seconds
@@ -44,7 +47,7 @@ class TokenAnalyzer:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=4)
+            timeout = aiohttp.ClientTimeout(total=8)  # increased from 4s
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
 
@@ -152,10 +155,16 @@ class TokenAnalyzer:
         )
 
         if confidence >= required_score:
+            # Resolve best symbol: lead → market data → mint prefix
+            resolved_symbol = (
+                (lead.get("symbol") or "").strip() or
+                (market.get("symbol") or "").strip() or
+                mint[:8]
+            )
             signal = {
                 "mint": mint,
-                "symbol": (lead.get("symbol") or "").strip("?").strip() or mint[:8],
-                "name": lead.get("name", "?"),
+                "symbol": resolved_symbol,
+                "name": lead.get("name") or market.get("name") or "?",
                 "is_new_coin": is_new_coin,
                 "market_cap_usd": market["market_cap_usd"],
                 "liquidity_usd": market["liquidity_usd"],
@@ -171,62 +180,55 @@ class TokenAnalyzer:
     # Check 1: RugCheck.xyz (free API)
     # ------------------------------------------------------------------
     async def _check_rugcheck(self, mint: str) -> dict:
-        """
-        Calls RugCheck free endpoint. Parses:
-        - risks array (honeypot, freeze authority, mint authority, LP burned)
-        - top holder concentration
-        Returns {"safe": bool, "reason": str}
-        """
-        session = await self._get_session()
-        url = f"{RUGCHECK_API}/tokens/{mint}/report/summary"
-        try:
-            async with session.get(url) as resp:
-                if resp.status == 429:
-                    # Rate limited — give benefit of doubt, log warning
-                    logger.warning(f"[RUGCHECK] Rate limited for {mint[:12]}, skipping check")
-                    return {"safe": True, "reason": "rate_limited"}
-                if resp.status == 400:
-                    # Token not yet indexed by RugCheck (too new) — skip it
-                    logger.debug(f"[RUGCHECK] Not indexed yet for {mint[:12]}, skipping")
-                    return {"safe": False, "reason": "not_indexed_yet"}
-                if resp.status != 200:
-                    return {"safe": False, "reason": f"HTTP {resp.status}"}
+            """
+            Calls RugCheck free endpoint with semaphore to limit concurrency.
+            Returns {"safe": bool, "reason": str}
+            """
+            session = await self._get_session()
+            url = f"{RUGCHECK_API}/tokens/{mint}/report/summary"
+            try:
+                async with _rugcheck_semaphore:
+                    async with session.get(url) as resp:
+                        if resp.status == 429:
+                            logger.warning(f"[RUGCHECK] Rate limited for {mint[:12]}, skipping check")
+                            return {"safe": True, "reason": "rate_limited"}
+                        if resp.status == 400:
+                            logger.debug(f"[RUGCHECK] Not indexed yet for {mint[:12]}")
+                            return {"safe": False, "reason": "not_indexed_yet"}
+                        if resp.status != 200:
+                            return {"safe": False, "reason": f"HTTP {resp.status}"}
 
-                data = await resp.json()
+                        data = await resp.json()
+                        risks = data.get("risks", [])
 
-                # RugCheck returns a "risks" list with severity levels
-                risks = data.get("risks", [])
-                score = data.get("score", 0)  # higher = riskier on some endpoints
+                        critical_names = {
+                            "Freeze Authority still enabled",
+                            "Mint Authority still enabled",
+                            "Low Liquidity",
+                            "Honeypot",
+                            "High holder concentration",
+                        }
+                        for risk in risks:
+                            name = risk.get("name", "")
+                            level = risk.get("level", "").lower()
+                            if level == "danger" or name in critical_names:
+                                return {"safe": False, "reason": name}
 
-                # Hard reject on critical risks
-                critical_names = {
-                    "Freeze Authority still enabled",
-                    "Mint Authority still enabled",
-                    "Low Liquidity",
-                    "Honeypot",
-                    "High holder concentration",
-                }
-                for risk in risks:
-                    name = risk.get("name", "")
-                    level = risk.get("level", "").lower()
-                    if level == "danger" or name in critical_names:
-                        return {"safe": False, "reason": name}
+                        top_holders = data.get("topHolders", [])
+                        if top_holders:
+                            top_pct = sum(h.get("pct", 0) for h in top_holders[:5])
+                            if top_pct > 60:
+                                return {"safe": False, "reason": f"Top 5 holders own {top_pct:.0f}%"}
 
-                # Check top holder concentration from full report if available
-                top_holders = data.get("topHolders", [])
-                if top_holders:
-                    top_pct = sum(h.get("pct", 0) for h in top_holders[:5])
-                    if top_pct > 60:
-                        return {"safe": False, "reason": f"Top 5 holders own {top_pct:.0f}%"}
+                        return {"safe": True, "reason": "ok"}
 
-                return {"safe": True, "reason": "ok"}
+            except asyncio.TimeoutError:
+                logger.warning(f"[RUGCHECK] Timeout for {mint[:12]}")
+                return {"safe": False, "reason": "timeout"}
+            except Exception as e:
+                logger.error(f"[RUGCHECK] Error: {e}")
+                return {"safe": False, "reason": str(e)}
 
-        except asyncio.TimeoutError:
-            logger.warning(f"[RUGCHECK] Timeout for {mint[:12]}")
-            return {"safe": False, "reason": "timeout"}
-        except Exception as e:
-            logger.error(f"[RUGCHECK] Error: {e}")
-            return {"safe": False, "reason": str(e)}
 
     # ------------------------------------------------------------------
     # Check 2: Creator wallet history
@@ -239,18 +241,18 @@ class TokenAnalyzer:
         session = await self._get_session()
         url = f"{RUGCHECK_API}/tokens/{creator}/report/summary"
         try:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return True  # Can't verify, give benefit of doubt
-                data = await resp.json()
-                # If creator wallet itself has danger flags, reject
-                risks = data.get("risks", [])
-                for risk in risks:
-                    if risk.get("level", "").lower() == "danger":
-                        return False
-                return True
+            async with _rugcheck_semaphore:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return True
+                    data = await resp.json()
+                    risks = data.get("risks", [])
+                    for risk in risks:
+                        if risk.get("level", "").lower() == "danger":
+                            return False
+                    return True
         except Exception:
-            return True  # Network error — don't block on this
+            return True
 
     # ------------------------------------------------------------------
     # Check 3: Market data (Birdeye + Dexscreener fallback)
@@ -307,6 +309,8 @@ class TokenAnalyzer:
                     "buy_5m": 0,
                     "sell_5m": 0,
                     "price": float(p.get("priceUsd", 0) or 0),
+                    "symbol": p.get("baseToken", {}).get("symbol", ""),
+                    "name": p.get("baseToken", {}).get("name", ""),
                 }
         except Exception:
             return None
