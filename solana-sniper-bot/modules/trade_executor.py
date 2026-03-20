@@ -23,7 +23,7 @@ from solders.transaction import VersionedTransaction
 
 from core.config import (
     JUPITER_API, PAPER_TRADE, SOL_MINT,
-    BASE_POSITION_SIZE_SOL, RISK_PCT_NORMAL, RISK_PCT_MAX,
+    BASE_POSITION_SIZE_SOL, RISK_PCT_MIN, RISK_PCT_MAX,
     MAX_OPEN_POSITIONS, TRADE_COOLDOWN_SECONDS,
     NEW_COIN_TP_MULTIPLIER, GROWN_COIN_TP_MULTIPLIER,
     PARTIAL_TP_LEVELS, PARTIAL_TP_PCT,
@@ -53,6 +53,7 @@ class Position:
         self.tp_levels_hit: set = set()
         self.open_time = time.time()
         self.tp_target = NEW_COIN_TP_MULTIPLIER if is_new_coin else GROWN_COIN_TP_MULTIPLIER
+        self.token_amount: int = 0  # actual tokens received at buy (set by _real_buy)
 
     @property
     def profit_pct(self) -> float:
@@ -78,6 +79,8 @@ class TradeExecutor:
         self._paper_pnl_sol: float = 0.0   # accumulated paper trade realized P&L
         # Per-source cooldown: new launches and established coins don't block each other
         self._last_trade_time_by_source: dict = {}
+        # Trade history for reporting
+        self.trade_history: list = []  # [{symbol, entry_price, exit_price, size_sol, pnl_sol, pnl_pct, reason, timestamp}]
         # Optional async callback: notify(msg: str) — set by main.py
         self.notify = None  # type: Optional[callable]
 
@@ -137,17 +140,27 @@ class TradeExecutor:
         await self._real_buy(mint, symbol, size_sol, is_new, confidence, source)
 
     async def _calculate_position_size(self, confidence: int) -> float:
-        """Scale position size with wallet balance and confidence."""
-        balance = await self.wallet.get_sol_balance()
-        # If balance is 0 (devnet/unfunded), use base size for paper trading
+        """Scale position size with balance and confidence.
+        In paper mode, scales off simulated paper balance so sizing grows with profits."""
+        if PAPER_TRADE:
+            # Use paper balance (real balance + accumulated paper P&L) for realistic scaling
+            real_balance = await self.wallet.get_sol_balance()
+            balance = max(real_balance + self._paper_pnl_sol, BASE_POSITION_SIZE_SOL)
+        else:
+            balance = await self.wallet.get_sol_balance()
+
         if balance < BASE_POSITION_SIZE_SOL:
             return BASE_POSITION_SIZE_SOL
-        # Scale risk % with confidence (75→2%, 100→5%)
-        risk_pct = RISK_PCT_NORMAL + (confidence - 75) / 25 * (RISK_PCT_MAX - RISK_PCT_NORMAL)
-        risk_pct = min(risk_pct, RISK_PCT_MAX)
-        size = max(balance * risk_pct, BASE_POSITION_SIZE_SOL)
-        size = min(size, balance * RISK_PCT_MAX)
-        return round(size, 6)
+
+        # Scale risk linearly: confidence 60 → RISK_PCT_MIN, confidence 100 → RISK_PCT_MAX
+        conf_clamped = max(60, min(confidence, 100))
+        t = (conf_clamped - 60) / 40  # 0.0 at conf=60, 1.0 at conf=100
+        risk_pct = RISK_PCT_MIN + t * (RISK_PCT_MAX - RISK_PCT_MIN)
+
+        size = balance * risk_pct
+        size = max(size, BASE_POSITION_SIZE_SOL)
+        size = min(size, balance * RISK_PCT_MAX)  # never exceed max risk
+        return round(size, 4)
 
     async def _paper_buy(self, mint: str, symbol: str, size_sol: float, is_new: bool, source: str = "unknown"):
         # Fetch real current price for accurate paper trade simulation
@@ -157,6 +170,18 @@ class TradeExecutor:
         self.open_positions[mint] = pos
         self._last_trade_time = time.time()
         self._last_trade_time_by_source[source] = time.time()
+        # Record buy in trade history
+        self.trade_history.append({
+            "symbol": symbol,
+            "entry_price": entry_price,
+            "exit_price": None,
+            "size_sol": size_sol,
+            "pnl_sol": None,
+            "pnl_pct": None,
+            "reason": "buy",
+            "timestamp": time.time(),
+            "mint": mint,
+        })
         logger.info(
             f"[PAPER] BUY {size_sol:.4f} SOL of {symbol} @ ${entry_price:.8f} | "
             f"target={'10x' if is_new else '3x'}"
@@ -224,9 +249,20 @@ class TradeExecutor:
             out_amount = int(quote.get("outAmount", 1))
             entry_price = lamports / out_amount if out_amount > 0 else 0.000001
             pos = Position(mint, symbol, entry_price, size_sol, is_new)
+            pos.token_amount = out_amount  # store actual tokens received for sell
             self.open_positions[mint] = pos
             self._last_trade_time = time.time()
             self._last_trade_time_by_source[source] = time.time()
+
+            # Telegram alert
+            if self.notify:
+                asyncio.create_task(self.notify(
+                    f"🟢 BUY {symbol}\n"
+                    f"Size: {size_sol:.4f} SOL\n"
+                    f"Entry: ${entry_price:.8f}\n"
+                    f"Target: {'10x' if is_new else '3x'}\n"
+                    f"tx: {sig}"
+                ))
 
         except Exception as e:
             logger.error(f"[EXECUTOR] Buy failed for {symbol}: {e}")
@@ -248,6 +284,29 @@ class TradeExecutor:
             # Realized P&L in SOL for this partial/full sell
             realized_sol = pos.size_sol * sell_pct * (pnl_pct / 100)
             self._paper_pnl_sol += realized_sol
+            
+            # Record trade history (update the matching buy entry, or append new)
+            buy_entry = next(
+                (t for t in reversed(self.trade_history)
+                 if t.get("mint") == mint and t["reason"] == "buy" and t["exit_price"] is None),
+                None
+            )
+            sell_record = {
+                "symbol": symbol,
+                "entry_price": pos.entry_price,
+                "exit_price": pos.current_price,
+                "size_sol": pos.size_sol * sell_pct,
+                "pnl_sol": realized_sol,
+                "pnl_pct": pnl_pct,
+                "reason": reason,
+                "timestamp": time.time(),
+                "mint": mint,
+            }
+            if buy_entry:
+                buy_entry.update(sell_record)
+            else:
+                self.trade_history.append(sell_record)
+            
             logger.info(
                 f"[PAPER] SELL {sell_pct*100:.0f}% of {symbol} | "
                 f"reason={reason} | P&L={pnl_pct:+.1f}% | realized={realized_sol:+.4f} SOL"
@@ -265,15 +324,22 @@ class TradeExecutor:
 
         # Real sell via Jupiter
         session = await self._get_session()
-        balance_sol = pos.size_sol * sell_pct
-        lamports = self.wallet.sol_to_lamports(balance_sol)
+        # Use actual token amount received at buy time, scaled by sell fraction
+        token_amount = getattr(pos, "token_amount", 0)
+        if token_amount > 0:
+            sell_token_amount = int(token_amount * sell_pct * pos.remaining_pct / pos.remaining_pct)
+            # Clamp to what we still hold
+            sell_token_amount = int(token_amount * sell_pct)
+        else:
+            # Fallback: estimate from SOL spent (less accurate but won't crash)
+            sell_token_amount = self.wallet.sol_to_lamports(pos.size_sol * sell_pct)
 
         try:
             quote_url = (
                 f"{JUPITER_API}/quote"
                 f"?inputMint={mint}"
                 f"&outputMint={SOL_MINT}"
-                f"&amount={lamports}"
+                f"&amount={sell_token_amount}"
                 f"&slippageBps=2000"  # wider slippage on exit for speed
             )
             async with session.get(quote_url) as resp:
@@ -300,6 +366,20 @@ class TradeExecutor:
                 opts=TxOpts(skip_preflight=True, max_retries=3),
             )
             logger.info(f"[EXECUTOR] ✅ SELL {symbol} | reason={reason} | tx={send_resp.value}")
+
+            # Calculate and log real P&L
+            pnl_pct = (pos.current_price - pos.entry_price) / pos.entry_price * 100 if pos.entry_price else 0
+            sol_out = int(quote.get("outAmount", 0)) / 1_000_000_000
+            logger.info(f"[EXECUTOR] P&L {symbol}: {pnl_pct:+.1f}% | received {sol_out:.4f} SOL")
+
+            if self.notify:
+                emoji = "🚀" if pnl_pct > 0 else "🔴"
+                asyncio.create_task(self.notify(
+                    f"{emoji} SELL {symbol} ({reason})\n"
+                    f"P&L: {pnl_pct:+.1f}%\n"
+                    f"Received: {sol_out:.4f} SOL\n"
+                    f"tx: {send_resp.value}"
+                ))
 
             pos.remaining_pct -= sell_pct
             if pos.remaining_pct <= 0.01:
@@ -424,10 +504,12 @@ class TradeExecutor:
     # Daily loss guard
     # ------------------------------------------------------------------
     async def _daily_loss_exceeded(self) -> bool:
-        if self._daily_start_balance == 0:
-            self._daily_start_balance = await self.wallet.get_sol_balance()
-            return False
         current = await self.wallet.get_sol_balance()
+        if self._daily_start_balance == 0:
+            self._daily_start_balance = current
+            return False
+        if self._daily_start_balance == 0:
+            return False
         loss_pct = (self._daily_start_balance - current) / self._daily_start_balance
         return loss_pct >= MAX_DAILY_LOSS_PCT
 

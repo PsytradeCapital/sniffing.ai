@@ -58,13 +58,14 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 # ---------------------------------------------------------------------------
 # Position Sizing
 # ---------------------------------------------------------------------------
-# Minimum trade size in SOL (~$1 at ~$200/SOL)
-BASE_POSITION_SIZE_SOL: float = 0.005 if MIN_DEPOSIT_MODE else 0.1
+# Minimum trade size in SOL
+BASE_POSITION_SIZE_SOL: float = 0.025 if MIN_DEPOSIT_MODE else 0.1
 
 # Dynamic sizing: % of wallet balance per trade
-RISK_PCT_MIN: float = 0.01   # 1% of balance minimum
-RISK_PCT_MAX: float = 0.05   # 5% of balance maximum (aggressive)
-RISK_PCT_NORMAL: float = 0.02  # 2% default
+# With 0.5 SOL (~$44): 5% = 0.025 SOL, 10% = 0.05 SOL, 15% = 0.075 SOL
+RISK_PCT_MIN: float = 0.05   # 5% of balance minimum
+RISK_PCT_MAX: float = 0.15   # 15% of balance maximum (high confidence)
+RISK_PCT_NORMAL: float = 0.08  # 8% default
 
 # Max concurrent open positions
 MAX_OPEN_POSITIONS: int = 3 if not AGGRESSIVE_MODE else 5

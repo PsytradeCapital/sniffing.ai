@@ -12,7 +12,7 @@ import asyncio
 import logging
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 
 import aiohttp
 from colorama import Fore, init
@@ -150,6 +150,16 @@ async def dashboard(
                     pnl = pos.profit_pct * 100
                     c = Fore.GREEN if pnl >= 0 else Fore.RED
                     print(c + f"    {pos.symbol:10s} | P&L: {pnl:+.1f}% | age: {pos.age_minutes:.0f}m | trailing: {pos.trailing_active}")
+
+            # Print last 5 closed trades
+            if executor.trade_history:
+                closed = [t for t in executor.trade_history if t.get("pnl_sol") is not None]
+                if closed:
+                    print(Fore.CYAN + "\n  Last Closed Trades:")
+                    for t in closed[-5:]:
+                        c = Fore.GREEN if t["pnl_sol"] > 0 else Fore.RED
+                        ts = datetime.fromtimestamp(t["timestamp"]).strftime("%H:%M")
+                        print(c + f"    {t['symbol']:10s} | invested: {t['size_sol']:.4f} SOL | {t['pnl_pct']:+.1f}% | {t['pnl_sol']:+.4f} SOL | {t['reason']} @ {ts}")
 
             print("=" * 52 + "\n")
 
