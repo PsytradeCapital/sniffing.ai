@@ -149,7 +149,9 @@ class TradeExecutor:
         # Per-source cooldown: new launches and established coins don't block each other
         self._last_trade_time_by_source: dict = {}
         # Trade history for reporting
-        self.trade_history: list = []  # [{symbol, entry_price, exit_price, size_sol, pnl_sol, pnl_pct, reason, timestamp}]
+        self.trade_history: list = []
+        # Blacklist: mints that exited at a loss — never re-enter these
+        self._loss_blacklist: set = set()
         # Optional async callback: notify(msg: str) — set by main.py
         self.notify = None  # type: Optional[callable]
 
@@ -181,6 +183,10 @@ class TradeExecutor:
 
         if mint in self.open_positions:
             logger.info(f"[EXECUTOR] Already in position for {symbol}. Skipping.")
+            return
+
+        if mint in self._loss_blacklist:
+            logger.info(f"[EXECUTOR] {symbol} blacklisted (previous loss). Skipping.")
             return
 
         cooldown_remaining = TRADE_COOLDOWN_SECONDS - (
@@ -392,6 +398,9 @@ class TradeExecutor:
             pos.remaining_pct -= sell_pct
             if pos.remaining_pct <= 0.01:
                 del self.open_positions[mint]
+                # Blacklist coins that closed at a loss — don't re-enter rugs
+                if pnl_pct < 0:
+                    self._loss_blacklist.add(mint)
             # Fire Telegram alert on notable exits
             if self.notify and abs(pnl_pct) >= 50:
                 emoji = "🚀" if pnl_pct > 0 else "🔴"
@@ -462,6 +471,9 @@ class TradeExecutor:
             pos.remaining_pct -= sell_pct
             if pos.remaining_pct <= 0.01:
                 del self.open_positions[mint]
+                # Blacklist coins that closed at a loss — don't re-enter rugs
+                if pnl_pct < 0:
+                    self._loss_blacklist.add(mint)
 
         except Exception as e:
             logger.error(f"[EXECUTOR] Sell failed for {symbol}: {e}")
