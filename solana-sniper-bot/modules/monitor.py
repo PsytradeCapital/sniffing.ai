@@ -1,10 +1,16 @@
 """
-monitor.py — Real-time WebSocket monitor for:
-  1. Pump.fun new token launches (pumpportal.fun API)
-  2. Raydium new AMM pool creation (Helius logsSubscribe)
+monitor.py — Real-time monitor for new Solana token launches and momentum plays.
+
+Sources (priority order):
+  1. Pump.fun WebSocket     — new launches, real-time (best for 10x new coins)
+  2. Pump.fun graduations   — tokens graduating to Raydium (high conviction)
+  3. Raydium WebSocket      — new AMM pools via Helius
+  4. Dexscreener new pairs  — tokens listed in last 24h with momentum
+  5. Dexscreener trending   — boosted/profiled tokens
+  6. Dexscreener search     — high volume $10k-$5M MC movers
+  7. Birdeye trending       — cross-validates with Dexscreener
 
 Runs 24/7, reconnects on drop, feeds asyncio.Queue for analysis.
-Handles 100+ launches/min without blocking.
 """
 import asyncio
 import json
@@ -15,12 +21,12 @@ from websockets.exceptions import ConnectionClosedError, WebSocketException
 
 from core.config import (
     HELIUS_WSS_URL, FALLBACK_WSS_URL,
-    PUMP_FUN_PROGRAM, RAYDIUM_AMM_PROGRAM
+    PUMP_FUN_PROGRAM, RAYDIUM_AMM_PROGRAM,
+    BIRDEYE_API_KEY,
 )
 
 logger = logging.getLogger(__name__)
 
-# Pump.fun public WebSocket (free, no key needed)
 PUMPPORTAL_WSS = "wss://pumpportal.fun/api/data"
 
 
@@ -39,11 +45,20 @@ class LaunchMonitor:
     # ------------------------------------------------------------------
     async def start(self):
         """Launch all listeners concurrently."""
-        logger.info("[MONITOR] Starting dual-source monitor...")
+        logger.info("[MONITOR] Starting all sources...")
+        logger.info("[MONITOR] Active sources:")
+        logger.info("[MONITOR]   1. Pump.fun WebSocket     — new launches + graduations (real-time)")
+        logger.info("[MONITOR]   2. Raydium WebSocket      — new AMM pools via Helius")
+        logger.info("[MONITOR]   3. Dexscreener new pairs  — tokens <6h old with momentum (every 45s)")
+        logger.info("[MONITOR]   4. Dexscreener trending   — boosted/profiled tokens (every 60s)")
+        logger.info("[MONITOR]   5. Dexscreener search     — $10k-$5M MC movers >20%/1h (every 60s)")
+        logger.info(f"[MONITOR]   6. Birdeye trending      — volume surge tokens ({'ACTIVE' if BIRDEYE_API_KEY else 'SKIPPED — no API key'})")
         await asyncio.gather(
             self._pump_fun_listener(),
             self._raydium_listener(),
             self._established_coin_scanner(),
+            self._birdeye_trending_scanner(),
+            self._dexscreener_new_pairs_scanner(),
         )
 
     # ------------------------------------------------------------------
@@ -114,6 +129,23 @@ class LaunchMonitor:
             }
             if trade_lead["mint"]:
                 await self.queue.put(trade_lead)
+
+        # Graduation event — token completed bonding curve, now on Raydium
+        # These are high-conviction: survived the bonding curve gauntlet
+        elif data.get("txType") == "complete":
+            mint = data.get("mint", "")
+            if mint:
+                grad_lead = {
+                    "source": "pump_fun_graduation",
+                    "type": "established",   # treat as established — already proven demand
+                    "mint": mint,
+                    "symbol": data.get("symbol", "?"),
+                    "name": data.get("name", "?"),
+                    "creator": data.get("traderPublicKey", ""),
+                    "graduated": True,
+                }
+                logger.info(f"[MONITOR] 🎓 Pump.fun graduation: {data.get('symbol', '?')} ({mint[:8]}...)")
+                await self.queue.put(grad_lead)
 
     # ------------------------------------------------------------------
     # 2. Raydium new pool listener (Helius logsSubscribe)
@@ -281,6 +313,111 @@ class LaunchMonitor:
                     logger.debug(f"[MONITOR] Dexscreener search error: {e}")
 
                 await asyncio.sleep(60)  # scan every 60 seconds
+
+    # ------------------------------------------------------------------
+    # 4. Dexscreener new pairs scanner (tokens listed in last 24h)
+    #    Catches coins right as they list — before they trend
+    # ------------------------------------------------------------------
+    async def _dexscreener_new_pairs_scanner(self):
+        """Polls Dexscreener for brand-new Solana pairs with early momentum."""
+        logger.info("[MONITOR] Dexscreener new pairs scanner starting...")
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            while self._running:
+                try:
+                    url = "https://api.dexscreener.com/latest/dex/pairs/solana"
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            await asyncio.sleep(30)
+                            continue
+                        data = await resp.json()
+                        pairs = data.get("pairs", [])
+                        for pair in pairs:
+                            age_hours = pair.get("pairAge", 9999) / 3600 if pair.get("pairAge") else 9999
+                            # Only pairs created in last 6 hours
+                            if age_hours > 6:
+                                continue
+                            fdv = float(pair.get("fdv", 0) or 0)
+                            vol_5m = float(pair.get("volume", {}).get("m5", 0) or 0)
+                            price_change_5m = float(pair.get("priceChange", {}).get("m5", 0) or 0)
+                            # Filter: some MC, active volume, positive momentum
+                            if fdv < 5_000 or fdv > 10_000_000:
+                                continue
+                            if vol_5m < 1_000:
+                                continue
+                            if price_change_5m < 5:
+                                continue
+                            mint = pair.get("baseToken", {}).get("address", "")
+                            if not mint or len(mint) < 32:
+                                continue
+                            is_new = fdv < 100_000
+                            lead = {
+                                "source": "dexscreener_new_pairs",
+                                "type": "new_launch" if is_new else "established",
+                                "mint": mint,
+                                "symbol": pair.get("baseToken", {}).get("symbol", "?"),
+                                "name": pair.get("baseToken", {}).get("name", "?"),
+                                "creator": "",
+                                "market_cap_usd": fdv,
+                                "age_hours": age_hours,
+                            }
+                            await self.queue.put(lead)
+                            await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.debug(f"[MONITOR] Dexscreener new pairs error: {e}")
+                await asyncio.sleep(45)
+
+    # ------------------------------------------------------------------
+    # 5. Birdeye trending scanner (requires API key, falls back gracefully)
+    #    Often catches momentum plays before Dexscreener
+    # ------------------------------------------------------------------
+    async def _birdeye_trending_scanner(self):
+        """Polls Birdeye trending tokens — best early momentum signal."""
+        if not BIRDEYE_API_KEY:
+            logger.info("[MONITOR] Birdeye API key not set — skipping Birdeye scanner")
+            return
+        logger.info("[MONITOR] Birdeye trending scanner starting...")
+        headers = {"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            while self._running:
+                try:
+                    # Birdeye trending tokens (sorted by 1h volume change)
+                    url = "https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hChangePercent&sort_type=desc&offset=0&limit=50&min_liquidity=5000"
+                    async with session.get(url, headers=headers) as resp:
+                        if resp.status != 200:
+                            await asyncio.sleep(60)
+                            continue
+                        data = await resp.json()
+                        tokens = data.get("data", {}).get("tokens", [])
+                        for token in tokens:
+                            mc = float(token.get("mc", 0) or 0)
+                            v24h_change = float(token.get("v24hChangePercent", 0) or 0)
+                            price_change_1h = float(token.get("priceChange1hPercent", 0) or 0)
+                            # Filter: reasonable MC, strong volume surge, positive price
+                            if mc < 10_000 or mc > 10_000_000:
+                                continue
+                            if v24h_change < 50:   # volume up 50%+ in 24h
+                                continue
+                            if price_change_1h < 5:
+                                continue
+                            mint = token.get("address", "")
+                            if not mint or len(mint) < 32:
+                                continue
+                            is_new = mc < 100_000
+                            lead = {
+                                "source": "birdeye_trending",
+                                "type": "new_launch" if is_new else "established",
+                                "mint": mint,
+                                "symbol": token.get("symbol", "?"),
+                                "name": token.get("name", "?"),
+                                "creator": "",
+                                "market_cap_usd": mc,
+                                "v24h_change_pct": v24h_change,
+                            }
+                            await self.queue.put(lead)
+                            await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.debug(f"[MONITOR] Birdeye trending error: {e}")
+                await asyncio.sleep(60)
 
     def stop(self):
         self._running = False

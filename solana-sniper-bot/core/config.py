@@ -59,13 +59,17 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 # Position Sizing
 # ---------------------------------------------------------------------------
 # Minimum trade size in SOL
-BASE_POSITION_SIZE_SOL: float = 0.025 if MIN_DEPOSIT_MODE else 0.1
+BASE_POSITION_SIZE_SOL: float = 0.075 if MIN_DEPOSIT_MODE else 0.2
 
-# Dynamic sizing: % of wallet balance per trade
-# With 0.5 SOL (~$44): 5% = 0.025 SOL, 10% = 0.05 SOL, 15% = 0.075 SOL
-RISK_PCT_MIN: float = 0.05   # 5% of balance minimum
-RISK_PCT_MAX: float = 0.15   # 15% of balance maximum (high confidence)
-RISK_PCT_NORMAL: float = 0.08  # 8% default
+# Dynamic sizing: % of paper/real balance per trade
+# With 0.5 SOL (~$44):  18% = 0.090 SOL (~$8.0)
+# With 0.6 SOL (~$53):  18% = 0.108 SOL (~$9.6)
+# With 1.0 SOL (~$89):  22% = 0.220 SOL (~$19.6)
+# With 2.0 SOL (~$178): 28% = 0.560 SOL (~$49.8)
+# With 5.0 SOL (~$445): 30% = 1.500 SOL (~$133)
+RISK_PCT_MIN: float = 0.18   # 18% of balance at confidence=60
+RISK_PCT_MAX: float = 0.30   # 30% of balance at confidence=100 (high conviction)
+RISK_PCT_NORMAL: float = 0.22  # 22% default
 
 # Max concurrent open positions
 MAX_OPEN_POSITIONS: int = 3 if not AGGRESSIVE_MODE else 5
@@ -89,10 +93,11 @@ GROWN_COIN_RR_MIN: float = 3.0
 PARTIAL_TP_LEVELS: list = [2.0, 5.0, 10.0]   # sell 33% at each
 PARTIAL_TP_PCT: float = 0.33                   # portion to sell at each level
 
-# Stop-loss
-HARD_STOP_LOSS_PCT: float = -0.20             # -20% hard cut
-TRAILING_STOP_TRIGGER_PCT: float = 0.20       # start trailing after +20%
-TRAILING_STOP_DISTANCE_PCT: float = 0.10      # trail 10% below high-water mark
+# Stop-loss — now handled per-position in Position.update_stop()
+# These are kept for reference only; actual values set in Position.__init__
+HARD_STOP_LOSS_PCT: float = -0.30             # new coin max loss (30%)
+TRAILING_STOP_TRIGGER_PCT: float = 0.0        # unused — trailing active from entry
+TRAILING_STOP_DISTANCE_PCT: float = 0.0       # unused — see Position class
 
 # Time-based stop: exit if no movement after N minutes
 TIME_STOP_MINUTES: int = 30

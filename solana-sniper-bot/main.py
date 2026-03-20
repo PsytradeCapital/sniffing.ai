@@ -68,13 +68,15 @@ async def send_telegram(msg: str):
 # Queue processors
 # ---------------------------------------------------------------------------
 async def analysis_worker(analyzer: TokenAnalyzer, analysis_queue: asyncio.Queue):
-    """Drains analysis queue — spawns a non-blocking task per lead."""
+    """Drains analysis queue — spawns a non-blocking task per lead.
+    Small stagger between tasks to avoid RugCheck rate limit bursts."""
     log = logging.getLogger("analysis_worker")
     while True:
         try:
             lead = await analysis_queue.get()
             asyncio.create_task(analyzer.analyze(lead))
             analysis_queue.task_done()
+            await asyncio.sleep(0.8)  # stagger to avoid RugCheck rate limit bursts
         except Exception as e:
             log.error(f"Analysis worker error: {e}")
 
@@ -149,7 +151,12 @@ async def dashboard(
                 for mint, pos in executor.open_positions.items():
                     pnl = pos.profit_pct * 100
                     c = Fore.GREEN if pnl >= 0 else Fore.RED
-                    print(c + f"    {pos.symbol:10s} | P&L: {pnl:+.1f}% | age: {pos.age_minutes:.0f}m | trailing: {pos.trailing_active}")
+                    phase = "P2" if pos.phase2_active else "P1"
+                    stop_pct = (pos.stop_price - pos.entry_price) / pos.entry_price * 100
+                    grace = " [grace]" if pos.age_minutes < pos.grace_period_minutes else ""
+                    sol_price_now = price  # reuse fetched SOL price
+                    invested_usd = pos.size_sol * sol_price_now
+                    print(c + f"    {pos.symbol:10s} | {pos.size_sol:.4f} SOL (${invested_usd:.2f}) | P&L: {pnl:+.1f}% | stop: {stop_pct:+.1f}% | {phase}{grace} | age: {pos.age_minutes:.0f}m")
 
             # Print last 5 closed trades
             if executor.trade_history:

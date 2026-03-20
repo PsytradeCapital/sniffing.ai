@@ -37,7 +37,21 @@ logger = logging.getLogger(__name__)
 
 
 class Position:
-    """Tracks a single open trade."""
+    """
+    Tracks a single open trade with two-phase trailing stop system.
+
+    Phase 1 (active immediately):
+      - Stop loss starts at entry - hard_stop_distance
+      - Every time price makes a new high, stop moves up by the SAME amount
+        (1:1 ratchet — stop always stays hard_stop_distance below the high water mark)
+      - New coin: stop distance = 30% of entry price
+      - Old coin: stop distance = 15% of entry price
+
+    Phase 2 (activates at big win threshold):
+      - Stop tightens to trail_distance_p2 below current high water mark
+      - New coin: triggers at +100% (2x), tightens to 15% below high
+      - Old coin: triggers at +30%, tightens to 7% below high
+    """
 
     def __init__(self, mint: str, symbol: str, entry_price: float,
                  size_sol: float, is_new_coin: bool):
@@ -46,14 +60,38 @@ class Position:
         self.entry_price = entry_price
         self.current_price = entry_price
         self.size_sol = size_sol
-        self.remaining_pct = 1.0          # fraction of position still open
+        self.remaining_pct = 1.0
         self.is_new_coin = is_new_coin
         self.high_water_mark = entry_price
-        self.trailing_active = False
         self.tp_levels_hit: set = set()
         self.open_time = time.time()
         self.tp_target = NEW_COIN_TP_MULTIPLIER if is_new_coin else GROWN_COIN_TP_MULTIPLIER
-        self.token_amount: int = 0  # actual tokens received at buy (set by _real_buy)
+        self.token_amount: int = 0
+        self.last_price_update: float = time.time()
+        self.consecutive_price_failures: int = 0
+
+        # --- Two-phase trailing parameters ---
+        if is_new_coin:
+            # New launches: very wide stop — memecoins need room to breathe
+            # P1: stop starts 50% below entry, trails 50% below high water mark
+            # P2: triggers at +100% (2x), tightens to 25% below high
+            self.hard_stop_distance = 0.50   # P1: 50% below entry / high
+            self.phase2_trigger_pct = 1.00   # P2 kicks in at +100% (2x)
+            self.phase2_trail_distance = 0.25  # P2: 25% below high
+        else:
+            # Established coins: wide but slightly tighter
+            # P1: stop starts 40% below entry, trails 40% below high water mark
+            # P2: triggers at +40%, tightens to 20% below high
+            self.hard_stop_distance = 0.40   # P1: 40% below entry / high
+            self.phase2_trigger_pct = 0.40   # P2 kicks in at +40%
+            self.phase2_trail_distance = 0.20  # P2: 20% below high
+
+        # Stop level starts at entry - hard_stop_distance
+        self.stop_price = entry_price * (1 - self.hard_stop_distance)
+        self.phase2_active = False
+        self.trailing_active = True
+        # Grace period: stop doesn't fire for first 10 minutes (avoids entry noise)
+        self.grace_period_minutes = 10
 
     @property
     def profit_pct(self) -> float:
@@ -64,6 +102,37 @@ class Position:
     @property
     def age_minutes(self) -> float:
         return (time.time() - self.open_time) / 60
+
+    def update_stop(self):
+        """
+        Proportional ratchet: stop always trails by a fixed % below the high water mark.
+        As price rises, stop rises with it maintaining the same distance ratio.
+        Stop NEVER moves down.
+
+        Example (old coin, 40% distance):
+          Entry $1.00 → stop $0.60
+          Price rises to $1.20 → stop moves to $0.72  (still 40% below $1.20)
+          Price rises to $1.50 → stop moves to $0.90  (still 40% below $1.50)
+          Phase 2 triggers at +40% → distance tightens to 15%
+          Price at $1.50 → stop jumps to $1.275 (15% below $1.50)
+          Price rises to $2.00 → stop = $1.70
+          Price drops to $1.70 → SELL, locked +70% profit
+        """
+        # Update high water mark
+        if self.current_price > self.high_water_mark:
+            self.high_water_mark = self.current_price
+
+        # Check phase 2 trigger
+        if not self.phase2_active and self.profit_pct >= self.phase2_trigger_pct:
+            self.phase2_active = True
+
+        # New stop = high water mark minus trailing distance
+        distance = self.phase2_trail_distance if self.phase2_active else self.hard_stop_distance
+        new_stop = self.high_water_mark * (1 - distance)
+
+        # Only ratchet UP, never down
+        if new_stop > self.stop_price:
+            self.stop_price = new_stop
 
 
 class TradeExecutor:
@@ -166,6 +235,11 @@ class TradeExecutor:
         # Fetch real current price for accurate paper trade simulation
         real_price = await self._get_current_price(mint)
         entry_price = real_price if real_price and real_price > 0 else 0.000001
+
+        # Resolve symbol if still unknown — try Dexscreener one more time at buy
+        if not symbol or symbol == "?":
+            symbol = await self._resolve_symbol(mint)
+
         pos = Position(mint, symbol, entry_price, size_sol, is_new)
         self.open_positions[mint] = pos
         self._last_trade_time = time.time()
@@ -190,6 +264,10 @@ class TradeExecutor:
     async def _real_buy(self, mint: str, symbol: str, size_sol: float,
                         is_new: bool, confidence: int, source: str = "unknown"):
         """Execute real buy via Jupiter V6 swap API."""
+        # Resolve symbol if still unknown
+        if not symbol or symbol == "?":
+            symbol = await self._resolve_symbol(mint)
+
         session = await self._get_session()
         lamports = self.wallet.sol_to_lamports(size_sol)
         fee = PRIORITY_FEE_AGGRESSIVE_LAMPORTS if is_new else PRIORITY_FEE_LAMPORTS
@@ -393,16 +471,12 @@ class TradeExecutor:
     # ------------------------------------------------------------------
     async def manage_positions(self):
         """
-        Runs every 5 seconds. Updates prices, checks TP/SL/trailing/time stops.
-        Re-reads EMERGENCY_SELL_ALL from env at runtime so it can be toggled
-        without restarting the bot (set EMERGENCY_SELL_ALL=True in .env and
-        send SIGHUP, or just restart — the flag is checked every 5s).
+        Runs every 5 seconds. Updates prices, ratchets stop prices, checks exits.
+        Two-phase trailing stop — active from the moment a position opens.
         """
         while True:
             try:
-                # Re-read at runtime so env changes take effect without restart
                 emergency = os.getenv("EMERGENCY_SELL_ALL", "False").lower() == "true"
-
                 if emergency and self.open_positions:
                     logger.warning("[EXECUTOR] EMERGENCY SELL ALL triggered!")
                     for mint in list(self.open_positions.keys()):
@@ -413,33 +487,60 @@ class TradeExecutor:
                     if not pos:
                         continue
 
-                    # Fetch current price
+                    # --- Price update ---
                     price = await self._get_current_price(mint)
                     if price and price > 0:
                         pos.current_price = price
+                        pos.last_price_update = time.time()
+                        pos.consecutive_price_failures = 0
+                    else:
+                        pos.consecutive_price_failures += 1
+                        stale_seconds = time.time() - pos.last_price_update
+                        # Exit after 15s of no price data — don't wait for -97%
+                        if stale_seconds > 15:
+                            logger.warning(f"[STOP] Price feed dead for {pos.symbol} ({stale_seconds:.0f}s) — exiting")
+                            await self.execute_sell(mint, "price_feed_dead")
+                            continue
 
-                    # Update high water mark
-                    if pos.current_price > pos.high_water_mark:
-                        pos.high_water_mark = pos.current_price
-
+                    # --- Ratchet stop upward FIRST, then check all exits ---
+                    pos.update_stop()
                     pnl = pos.profit_pct
+                    phase = "P2" if pos.phase2_active else "P1"
 
-                    # --- Hard stop-loss ---
-                    if pnl <= HARD_STOP_LOSS_PCT:
-                        logger.warning(f"[STOP] Hard stop hit for {pos.symbol} | P&L={pnl*100:.1f}%")
-                        await self.execute_sell(mint, "hard_stop_loss")
+                    # --- Trailing stop hit (skip during grace period) ---
+                    in_grace = pos.age_minutes < pos.grace_period_minutes
+                    if not in_grace and pos.current_price <= pos.stop_price:
+                        logger.info(
+                            f"[STOP] {phase} trailing stop hit for {pos.symbol} | "
+                            f"price={pos.current_price:.8f} stop={pos.stop_price:.8f} | "
+                            f"P&L={pnl*100:+.1f}%"
+                        )
+                        await self.execute_sell(mint, f"trailing_stop_{phase.lower()}")
                         continue
 
-                    # --- Time-based stop ---
-                    if pos.age_minutes >= TIME_STOP_MINUTES and pnl < 0.10:
-                        logger.info(f"[STOP] Time stop for {pos.symbol} | age={pos.age_minutes:.0f}m | P&L={pnl*100:.1f}%")
+                    # --- Absolute hard floor: safety net for grace period rugs ---
+                    # Uses same distance as the initial stop so it's consistent
+                    # Only fires during grace period (after grace, trailing stop handles it)
+                    floor_distance = pos.hard_stop_distance
+                    absolute_floor = pos.entry_price * (1 - floor_distance)
+                    if pos.current_price < absolute_floor:
+                        logger.warning(
+                            f"[STOP] Hard floor hit for {pos.symbol} | "
+                            f"P&L={pnl*100:+.1f}% | floor={floor_distance*100:.0f}% below entry"
+                        )
+                        await self.execute_sell(mint, "hard_floor_stop")
+                        continue
+
+                    # --- Time-based stop: exit if flat after 30 min ---
+                    if pos.age_minutes >= TIME_STOP_MINUTES and pnl < 0.05:
+                        logger.info(f"[STOP] Time stop for {pos.symbol} | age={pos.age_minutes:.0f}m | P&L={pnl*100:+.1f}%")
                         await self.execute_sell(mint, "time_stop")
                         continue
 
                     # --- Partial take-profits ---
                     for level in PARTIAL_TP_LEVELS:
                         if level not in pos.tp_levels_hit and pnl >= (level - 1):
-                            logger.info(f"[TP] Partial TP {level}x for {pos.symbol}")
+                            logger.info(f"[TP] Partial TP {level}x for {pos.symbol} | P&L={pnl*100:+.1f}%")
                             await self.execute_sell(mint, f"partial_tp_{level}x", PARTIAL_TP_PCT)
                             pos.tp_levels_hit.add(level)
 
@@ -449,20 +550,10 @@ class TradeExecutor:
                         await self.execute_sell(mint, f"full_tp_{pos.tp_target}x")
                         continue
 
-                    # --- Trailing stop ---
-                    if pnl >= TRAILING_STOP_TRIGGER_PCT:
-                        pos.trailing_active = True
-
-                    if pos.trailing_active and pos.high_water_mark > pos.entry_price:
-                        drop_from_high = (pos.high_water_mark - pos.current_price) / pos.high_water_mark
-                        if drop_from_high >= TRAILING_STOP_DISTANCE_PCT:
-                            logger.info(
-                                f"[STOP] Trailing stop for {pos.symbol} | "
-                                f"high={pos.high_water_mark:.8f} | "
-                                f"current={pos.current_price:.8f} | "
-                                f"drop={drop_from_high*100:.1f}%"
-                            )
-                            await self.execute_sell(mint, "trailing_stop")
+                    logger.debug(
+                        f"[POS] {pos.symbol} | P&L={pnl*100:+.1f}% | "
+                        f"stop={pos.stop_price:.8f} | high={pos.high_water_mark:.8f} | {phase}"
+                    )
 
             except Exception as e:
                 logger.error(f"[EXECUTOR] manage_positions error: {e}")
@@ -472,9 +563,31 @@ class TradeExecutor:
     # ------------------------------------------------------------------
     # Price fetching (Birdeye → Dexscreener fallback)
     # ------------------------------------------------------------------
+    async def _resolve_symbol(self, mint: str) -> str:
+        """Last-chance symbol resolution from Dexscreener at buy time."""
+        try:
+            session = await self._get_session()
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        sym = pairs[0].get("baseToken", {}).get("symbol", "")
+                        if sym:
+                            return sym
+        except Exception:
+            pass
+        return mint[:8]  # fallback to mint prefix
+
     async def _get_current_price(self, mint: str) -> Optional[float]:
+        """
+        Price fetch with 3 sources: Jupiter → Birdeye → Dexscreener.
+        Returns None only if ALL three fail — reduces false price_feed_dead exits.
+        """
         session = await self._get_session()
-        # Try Jupiter price API (free, no key)
+
+        # 1. Jupiter price API (free, fast, no key)
         try:
             url = f"https://price.jup.ag/v4/price?ids={mint}"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
@@ -486,15 +599,31 @@ class TradeExecutor:
         except Exception:
             pass
 
-        # Fallback: Dexscreener
+        # 2. Birdeye (free tier, good coverage for new tokens)
+        try:
+            from core.config import BIRDEYE_API_KEY, BIRDEYE_API
+            headers = {"X-API-KEY": BIRDEYE_API_KEY} if BIRDEYE_API_KEY else {}
+            url = f"{BIRDEYE_API}/defi/price?address={mint}"
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    price = data.get("data", {}).get("value", 0)
+                    if price and float(price) > 0:
+                        return float(price)
+        except Exception:
+            pass
+
+        # 3. Dexscreener (last resort — slower but very broad coverage)
         try:
             url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     pairs = data.get("pairs", [])
                     if pairs:
-                        return float(pairs[0].get("priceUsd", 0) or 0)
+                        price = float(pairs[0].get("priceUsd", 0) or 0)
+                        if price > 0:
+                            return price
         except Exception:
             pass
 

@@ -31,7 +31,7 @@ _rugcheck_semaphore = asyncio.Semaphore(3)
 
 # Simple in-memory cache to avoid re-analyzing the same mint within 60s
 _analysis_cache: dict[str, float] = {}
-CACHE_TTL = 60  # seconds
+CACHE_TTL = 300  # 5 minutes — don't re-analyze the same coin within 5 min
 
 
 class TokenAnalyzer:
