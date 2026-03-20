@@ -72,14 +72,14 @@ class Position:
 
         # --- Two-phase trailing parameters ---
         if is_new_coin:
-            # New launches: very wide stop — memecoins need room to breathe
+            # New launches: wide stop — memecoins need room to breathe
             # P1: stop starts 50% below entry, trails 50% below high water mark
             # P2: triggers at +100% (2x), tightens to 25% below high
             self.hard_stop_distance = 0.50   # P1: 50% below entry / high
             self.phase2_trigger_pct = 1.00   # P2 kicks in at +100% (2x)
             self.phase2_trail_distance = 0.25  # P2: 25% below high
         else:
-            # Established coins: wide but slightly tighter
+            # Established coins: slightly tighter
             # P1: stop starts 40% below entry, trails 40% below high water mark
             # P2: triggers at +40%, tightens to 20% below high
             self.hard_stop_distance = 0.40   # P1: 40% below entry / high
@@ -90,8 +90,8 @@ class Position:
         self.stop_price = entry_price * (1 - self.hard_stop_distance)
         self.phase2_active = False
         self.trailing_active = True
-        # Grace period: stop doesn't fire for first 10 minutes (avoids entry noise)
-        self.grace_period_minutes = 10
+        # Grace period: 5 minutes
+        self.grace_period_minutes = 5
 
     @property
     def profit_pct(self) -> float:
@@ -507,28 +507,28 @@ class TradeExecutor:
                     pnl = pos.profit_pct
                     phase = "P2" if pos.phase2_active else "P1"
 
-                    # --- Trailing stop hit (skip during grace period) ---
+                    # --- Stop loss check ---
+                    # stop_price is always the ratcheted trailing stop (never moves down).
+                    # - During grace: fires as hard floor only (protects against entry rugs)
+                    # - After grace: fires as trailing stop (locks in profits as price rises)
+                    # If price rose to +80% and stop ratcheted to +30%, a rug exits at +30%.
+                    # If coin rugs straight from entry, exits at initial stop (-50% new / -40% old).
                     in_grace = pos.age_minutes < pos.grace_period_minutes
-                    if not in_grace and pos.current_price <= pos.stop_price:
-                        logger.info(
-                            f"[STOP] {phase} trailing stop hit for {pos.symbol} | "
-                            f"price={pos.current_price:.8f} stop={pos.stop_price:.8f} | "
-                            f"P&L={pnl*100:+.1f}%"
-                        )
-                        await self.execute_sell(mint, f"trailing_stop_{phase.lower()}")
-                        continue
-
-                    # --- Absolute hard floor: safety net for grace period rugs ---
-                    # Uses same distance as the initial stop so it's consistent
-                    # Only fires during grace period (after grace, trailing stop handles it)
-                    floor_distance = pos.hard_stop_distance
-                    absolute_floor = pos.entry_price * (1 - floor_distance)
-                    if pos.current_price < absolute_floor:
-                        logger.warning(
-                            f"[STOP] Hard floor hit for {pos.symbol} | "
-                            f"P&L={pnl*100:+.1f}% | floor={floor_distance*100:.0f}% below entry"
-                        )
-                        await self.execute_sell(mint, "hard_floor_stop")
+                    if pos.current_price <= pos.stop_price:
+                        stop_pct = (pos.stop_price / pos.entry_price - 1) * 100
+                        if in_grace:
+                            reason = "hard_floor_stop"
+                            logger.warning(
+                                f"[STOP] Hard floor (grace) for {pos.symbol} | "
+                                f"P&L={pnl*100:+.1f}% | floor={stop_pct:+.1f}%"
+                            )
+                        else:
+                            reason = f"trailing_stop_{phase.lower()}"
+                            logger.info(
+                                f"[STOP] {phase} trailing stop for {pos.symbol} | "
+                                f"P&L={pnl*100:+.1f}% | stop={stop_pct:+.1f}%"
+                            )
+                        await self.execute_sell(mint, reason)
                         continue
 
                     # --- Time-based stop: exit if flat after 30 min ---
