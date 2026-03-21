@@ -40,19 +40,26 @@ logger = logging.getLogger(__name__)
 
 class Position:
     """
-    Tracks a single open trade with two-phase trailing stop system.
+    Tracks a single open trade with THREE-phase trailing stop system.
 
     Phase 1 (active immediately):
       - Stop loss starts at entry - hard_stop_distance
       - Every time price makes a new high, stop moves up by the SAME amount
         (1:1 ratchet — stop always stays hard_stop_distance below the high water mark)
-      - New coin: stop distance = 30% of entry price
-      - Old coin: stop distance = 15% of entry price
+      - New coin: stop distance = 50% of entry price
+      - Old coin: stop distance = 40% of entry price
 
-    Phase 2 (activates at big win threshold):
+    Phase 2 (activates at first big win):
       - Stop tightens to trail_distance_p2 below current high water mark
-      - New coin: triggers at +100% (2x), tightens to 15% below high
-      - Old coin: triggers at +30%, tightens to 7% below high
+      - New coin: triggers at +100% (2x), tightens to 25% below high
+      - Old coin: triggers at +40%, tightens to 20% below high
+
+    Phase 3 (MOONSHOT MODE - activates at 200%+ for potential 1000-10000% runners):
+      - Stop WIDENS to give room for massive runs
+      - Triggers at +200% (3x)
+      - New coin: widens to 35% below high (from 25%)
+      - Old coin: widens to 30% below high (from 20%)
+      - Allows coins to breathe and run to 10x, 50x, 100x without premature exit
     """
 
     def __init__(self, mint: str, symbol: str, entry_price: float,
@@ -72,25 +79,32 @@ class Position:
         self.last_price_update: float = time.time()
         self.consecutive_price_failures: int = 0
 
-        # --- Two-phase trailing parameters ---
+        # --- Three-phase trailing parameters ---
         if is_new_coin:
             # New launches: wide stop — memecoins need room to breathe
             # P1: stop starts 50% below entry, trails 50% below high water mark
             # P2: triggers at +100% (2x), tightens to 25% below high
+            # P3: triggers at +200% (3x), WIDENS to 35% below high (moonshot mode)
             self.hard_stop_distance = 0.50   # P1: 50% below entry / high
             self.phase2_trigger_pct = 1.00   # P2 kicks in at +100% (2x)
             self.phase2_trail_distance = 0.25  # P2: 25% below high
+            self.phase3_trigger_pct = 2.00   # P3 kicks in at +200% (3x) — MOONSHOT
+            self.phase3_trail_distance = 0.35  # P3: 35% below high (WIDER for big runs)
         else:
-            # Established coins: slightly tighter
+            # Established coins: slightly tighter but still room for moonshots
             # P1: stop starts 40% below entry, trails 40% below high water mark
             # P2: triggers at +40%, tightens to 20% below high
+            # P3: triggers at +200% (3x), WIDENS to 30% below high (moonshot mode)
             self.hard_stop_distance = 0.40   # P1: 40% below entry / high
             self.phase2_trigger_pct = 0.40   # P2 kicks in at +40%
             self.phase2_trail_distance = 0.20  # P2: 20% below high
+            self.phase3_trigger_pct = 2.00   # P3 kicks in at +200% (3x) — MOONSHOT
+            self.phase3_trail_distance = 0.30  # P3: 30% below high (WIDER for big runs)
 
         # Stop level starts at entry - hard_stop_distance
         self.stop_price = entry_price * (1 - self.hard_stop_distance)
         self.phase2_active = False
+        self.phase3_active = False  # NEW: Phase 3 moonshot mode
         self.trailing_active = True
         # Grace period: 5 minutes
         self.grace_period_minutes = 5
@@ -111,25 +125,46 @@ class Position:
         As price rises, stop rises with it maintaining the same distance ratio.
         Stop NEVER moves down.
 
-        Example (old coin, 40% distance):
-          Entry $1.00 → stop $0.60
-          Price rises to $1.20 → stop moves to $0.72  (still 40% below $1.20)
-          Price rises to $1.50 → stop moves to $0.90  (still 40% below $1.50)
-          Phase 2 triggers at +40% → distance tightens to 15%
-          Price at $1.50 → stop jumps to $1.275 (15% below $1.50)
-          Price rises to $2.00 → stop = $1.70
-          Price drops to $1.70 → SELL, locked +70% profit
+        THREE-PHASE SYSTEM:
+        Phase 1: Wide protection (50% new / 40% old)
+        Phase 2: Tighter lock-in (25% new / 20% old) at 2x/1.4x
+        Phase 3: MOONSHOT MODE (35% new / 30% old) at 3x — WIDENS to let winners run
+
+        Example (new coin):
+          Entry $1.00 → P1 stop $0.50 (50% below)
+          Price rises to $2.00 (+100%) → P2 activates, stop $1.50 (25% below $2.00)
+          Price rises to $3.00 (+200%) → P3 activates, stop $1.95 (35% below $3.00)
+          Price rises to $10.00 (+900%) → P3 stop $6.50 (35% below $10.00)
+          Price rises to $100.00 (+9900%) → P3 stop $65.00 (still 35% below)
+          Price drops to $65.00 → SELL, locked +6400% profit
+
+        Phase 3 gives room for 10x, 50x, 100x runs without premature exit.
         """
         # Update high water mark
         if self.current_price > self.high_water_mark:
             self.high_water_mark = self.current_price
 
-        # Check phase 2 trigger
-        if not self.phase2_active and self.profit_pct >= self.phase2_trigger_pct:
+        # Check phase 3 trigger (moonshot mode at +200%)
+        if not self.phase3_active and self.profit_pct >= self.phase3_trigger_pct:
+            self.phase3_active = True
+            logger.info(
+                f"[PHASE3] 🚀 MOONSHOT MODE activated for {self.symbol} at +{self.profit_pct*100:.0f}% | "
+                f"Widening trail to {self.phase3_trail_distance*100:.0f}% for big runs"
+            )
+
+        # Check phase 2 trigger (first lock-in)
+        elif not self.phase2_active and self.profit_pct >= self.phase2_trigger_pct:
             self.phase2_active = True
 
+        # Select trailing distance based on active phase
+        if self.phase3_active:
+            distance = self.phase3_trail_distance  # WIDEST for moonshots
+        elif self.phase2_active:
+            distance = self.phase2_trail_distance  # Tighter lock-in
+        else:
+            distance = self.hard_stop_distance     # Initial wide protection
+
         # New stop = high water mark minus trailing distance
-        distance = self.phase2_trail_distance if self.phase2_active else self.hard_stop_distance
         new_stop = self.high_water_mark * (1 - distance)
 
         # Only ratchet UP, never down
@@ -210,7 +245,7 @@ class TradeExecutor:
             return
 
         # --- Position sizing ---
-        size_sol = await self._calculate_position_size(confidence)
+        size_sol = await self._calculate_position_size(confidence, is_new)
         source = signal.get("source", "unknown")
         logger.info(f"[EXECUTOR] BUY signal: {symbol} ({mint[:12]}...) | size={size_sol:.4f} SOL | conf={confidence}")
 
@@ -220,9 +255,13 @@ class TradeExecutor:
 
         await self._real_buy(mint, symbol, size_sol, is_new, confidence, source)
 
-    async def _calculate_position_size(self, confidence: int) -> float:
-        """Scale position size with balance and confidence.
-        In paper mode, scales off simulated paper balance so sizing grows with profits."""
+    async def _calculate_position_size(self, confidence: int, is_new_coin: bool = True) -> float:
+        """
+        Scale position size with balance and confidence.
+        In paper mode, scales off simulated paper balance so sizing grows with profits.
+        
+        NEW: Established coins get 1.5x larger position size (they're less risky).
+        """
         if PAPER_TRADE:
             # Use paper balance (real balance + accumulated paper P&L) for realistic scaling
             real_balance = await self.wallet.get_sol_balance()
@@ -239,8 +278,14 @@ class TradeExecutor:
         risk_pct = RISK_PCT_MIN + t * (RISK_PCT_MAX - RISK_PCT_MIN)
 
         size = balance * risk_pct
+        
+        # NEW: Established coins get 1.5x larger position (they're proven, less risky)
+        if not is_new_coin:
+            size *= 1.5
+            logger.debug(f"[SIZING] Established coin bonus: {size:.4f} SOL (1.5x multiplier)")
+
         size = max(size, BASE_POSITION_SIZE_SOL)
-        size = min(size, balance * RISK_PCT_MAX)  # never exceed max risk
+        size = min(size, balance * RISK_PCT_MAX * 1.5)  # allow up to 45% for established coins
         return round(size, 4)
 
     async def _paper_buy(self, mint: str, symbol: str, size_sol: float, is_new: bool, source: str = "unknown"):
@@ -538,7 +583,13 @@ class TradeExecutor:
                     # --- Ratchet stop upward FIRST, then check all exits ---
                     pos.update_stop()
                     pnl = pos.profit_pct
-                    phase = "P2" if pos.phase2_active else "P1"
+                    # Show current phase (P1, P2, or P3)
+                    if pos.phase3_active:
+                        phase = "P3-MOONSHOT"
+                    elif pos.phase2_active:
+                        phase = "P2"
+                    else:
+                        phase = "P1"
 
                     # --- Stop loss check ---
                     in_grace = pos.age_minutes < pos.grace_period_minutes

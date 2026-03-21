@@ -108,6 +108,15 @@ HARD_STOP_LOSS_PCT: float = -0.30             # new coin max loss (30%)
 TRAILING_STOP_TRIGGER_PCT: float = 0.0        # unused — trailing active from entry
 TRAILING_STOP_DISTANCE_PCT: float = 0.0       # unused — see Position class
 
+# Phase 3 Moonshot Mode (NEW in v2.0)
+# When a coin hits +200% (3x), the trailing stop WIDENS to give room for 1000-10000% runs
+# This prevents premature exits on potential moonshots
+# New coins: 35% trail (from 25% in P2)
+# Old coins: 30% trail (from 20% in P2)
+PHASE3_MOONSHOT_TRIGGER_PCT: float = 2.00     # triggers at +200% (3x)
+PHASE3_TRAIL_NEW: float = 0.35                # 35% below high for new coins
+PHASE3_TRAIL_OLD: float = 0.30                # 30% below high for established coins
+
 # Time-based stop: exit if no movement after N minutes
 TIME_STOP_MINUTES: int = 30
 
