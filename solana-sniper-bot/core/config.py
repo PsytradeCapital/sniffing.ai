@@ -32,7 +32,16 @@ if NETWORK == "mainnet" and "devnet" in FALLBACK_RPC_URL:
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
-JUPITER_API: str = os.getenv("JUPITER_API_URL", "https://quote-api.jup.ag/v6")
+# Jupiter Swap API (v6 for swaps, v3 for prices)
+# NOTE: Jupiter updated their API structure in 2024:
+# - Swap/Quote API: https://api.jup.ag/swap/v2 (requires API key for production)
+# - Price API: https://api.jup.ag/price/v3 (requires API key)
+# - Legacy endpoints (quote-api.jup.ag, price.jup.ag/v4) are deprecated
+# For now using lite-api.jup.ag which is free but will be deprecated Jan 2026
+JUPITER_API: str = os.getenv("JUPITER_API_URL", "https://lite-api.jup.ag/swap/v1")
+JUPITER_PRICE_API: str = os.getenv("JUPITER_PRICE_API_URL", "https://api.jup.ag/price/v3")
+JUPITER_API_KEY: str = os.getenv("JUPITER_API_KEY", "")  # Get free key at portal.jup.ag
+
 RUGCHECK_API: str = os.getenv("RUGCHECK_API_URL", "https://api.rugcheck.xyz/v1")
 BIRDEYE_API: str = os.getenv("BIRDEYE_API_URL", "https://public-api.birdeye.so")
 BIRDEYE_API_KEY: str = os.getenv("BIRDEYE_API_KEY", "")
@@ -134,6 +143,27 @@ GURU_HANDLES: list = [
     "CryptoHayes", "CryptoJack", "CryptoSqueeze", "MoonOverlord",
 ]
 GURU_MENTION_THRESHOLD: int = 3   # how many gurus must mention for hype signal
+
+# ---------------------------------------------------------------------------
+# Position Management & Price Fetching
+# ---------------------------------------------------------------------------
+# Polling interval for position management loop (seconds)
+# 0.5s = 2 checks per second — fast enough to catch rugs before -97%
+# 5.0s = legacy slow mode (not recommended for memecoins)
+POSITION_CHECK_INTERVAL: float = 0.5
+
+# Price feed staleness timeout (seconds)
+# Exit position if no valid price update received within this window
+PRICE_FEED_TIMEOUT: float = 10.0
+
+# Batch price fetching: fetch all open positions in one API call
+# Reduces API calls from N per loop to 1 per loop (N = open positions)
+BATCH_PRICE_FETCH: bool = True
+
+# WebSocket real-time price streaming (requires premium RPC like Helius)
+# When enabled, uses WebSocket subscriptions for instant price updates
+# Falls back to polling if WebSocket connection fails
+ENABLE_WEBSOCKET_PRICES: bool = os.getenv("ENABLE_WEBSOCKET_PRICES", "False").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Logging

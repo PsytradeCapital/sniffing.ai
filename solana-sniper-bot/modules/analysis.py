@@ -180,54 +180,96 @@ class TokenAnalyzer:
     # Check 1: RugCheck.xyz (free API)
     # ------------------------------------------------------------------
     async def _check_rugcheck(self, mint: str) -> dict:
-            """
-            Calls RugCheck free endpoint with semaphore to limit concurrency.
-            Returns {"safe": bool, "reason": str}
-            """
-            session = await self._get_session()
-            url = f"{RUGCHECK_API}/tokens/{mint}/report/summary"
-            try:
-                async with _rugcheck_semaphore:
-                    async with session.get(url) as resp:
-                        if resp.status == 429:
-                            logger.warning(f"[RUGCHECK] Rate limited for {mint[:12]}, skipping check")
-                            return {"safe": True, "reason": "rate_limited"}
-                        if resp.status == 400:
-                            logger.debug(f"[RUGCHECK] Not indexed yet for {mint[:12]}")
-                            return {"safe": False, "reason": "not_indexed_yet"}
-                        if resp.status != 200:
-                            return {"safe": False, "reason": f"HTTP {resp.status}"}
+        """
+        Calls RugCheck free endpoint with semaphore to limit concurrency.
+        Enhanced with strict LP burn, mint authority, and freeze authority checks.
+        Returns {"safe": bool, "reason": str}
+        """
+        session = await self._get_session()
+        url = f"{RUGCHECK_API}/tokens/{mint}/report/summary"
+        try:
+            async with _rugcheck_semaphore:
+                async with session.get(url) as resp:
+                    if resp.status == 429:
+                        logger.warning(f"[RUGCHECK] Rate limited for {mint[:12]}, skipping check")
+                        return {"safe": True, "reason": "rate_limited"}
+                    if resp.status == 400:
+                        logger.debug(f"[RUGCHECK] Not indexed yet for {mint[:12]}")
+                        return {"safe": False, "reason": "not_indexed_yet"}
+                    if resp.status != 200:
+                        return {"safe": False, "reason": f"HTTP {resp.status}"}
 
-                        data = await resp.json()
-                        risks = data.get("risks", [])
+                    data = await resp.json()
+                    risks = data.get("risks", [])
 
-                        critical_names = {
-                            "Freeze Authority still enabled",
-                            "Mint Authority still enabled",
-                            "Low Liquidity",
-                            "Honeypot",
-                            "High holder concentration",
-                        }
-                        for risk in risks:
-                            name = risk.get("name", "")
-                            level = risk.get("level", "").lower()
-                            if level == "danger" or name in critical_names:
-                                return {"safe": False, "reason": name}
+                    # --- CRITICAL CHECKS (instant reject) ---
+                    critical_names = {
+                        "Freeze Authority still enabled",
+                        "Mint Authority still enabled",
+                        "Low Liquidity",
+                        "Honeypot",
+                        "High holder concentration",
+                        "LP tokens not burned",  # NEW: LP must be burned
+                        "Unlocked liquidity",     # NEW: LP must be locked or burned
+                    }
+                    
+                    # Check for critical risks
+                    for risk in risks:
+                        name = risk.get("name", "")
+                        level = risk.get("level", "").lower()
+                        if level == "danger" or name in critical_names:
+                            return {"safe": False, "reason": name}
 
-                        top_holders = data.get("topHolders", [])
-                        if top_holders:
-                            top_pct = sum(h.get("pct", 0) for h in top_holders[:5])
-                            if top_pct > 60:
-                                return {"safe": False, "reason": f"Top 5 holders own {top_pct:.0f}%"}
+                    # --- ENHANCED AUTHORITY CHECKS ---
+                    # Explicitly verify mint and freeze authorities are revoked
+                    token_meta = data.get("tokenMeta", {})
+                    
+                    # Mint authority check
+                    mint_authority = token_meta.get("mintAuthority")
+                    if mint_authority and mint_authority != "null" and mint_authority != "":
+                        return {"safe": False, "reason": "Mint authority not revoked"}
+                    
+                    # Freeze authority check
+                    freeze_authority = token_meta.get("freezeAuthority")
+                    if freeze_authority and freeze_authority != "null" and freeze_authority != "":
+                        return {"safe": False, "reason": "Freeze authority not revoked"}
 
-                        return {"safe": True, "reason": "ok"}
+                    # --- LP BURN CHECK ---
+                    # Check if LP tokens are burned (100% of LP should be in burn address)
+                    lp_data = data.get("markets", [])
+                    if lp_data:
+                        for market in lp_data:
+                            lp_locked_pct = market.get("lpLockedPct", 0)
+                            lp_burned = market.get("lpBurned", False)
+                            
+                            # Require either 100% LP burned OR 100% LP locked
+                            if not lp_burned and lp_locked_pct < 100:
+                                return {
+                                    "safe": False, 
+                                    "reason": f"LP not secured (burned={lp_burned}, locked={lp_locked_pct}%)"
+                                }
 
-            except asyncio.TimeoutError:
-                logger.warning(f"[RUGCHECK] Timeout for {mint[:12]}")
-                return {"safe": False, "reason": "timeout"}
-            except Exception as e:
-                logger.error(f"[RUGCHECK] Error: {e}")
-                return {"safe": False, "reason": str(e)}
+                    # --- TOP HOLDER CONCENTRATION CHECK (tightened) ---
+                    top_holders = data.get("topHolders", [])
+                    if top_holders:
+                        # Top 5 holders should own < 50% (tightened from 60%)
+                        top5_pct = sum(h.get("pct", 0) for h in top_holders[:5])
+                        if top5_pct > 50:
+                            return {"safe": False, "reason": f"Top 5 holders own {top5_pct:.0f}%"}
+                        
+                        # Top 10 holders should own < 70%
+                        top10_pct = sum(h.get("pct", 0) for h in top_holders[:10])
+                        if top10_pct > 70:
+                            return {"safe": False, "reason": f"Top 10 holders own {top10_pct:.0f}%"}
+
+                    return {"safe": True, "reason": "ok"}
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[RUGCHECK] Timeout for {mint[:12]}")
+            return {"safe": False, "reason": "timeout"}
+        except Exception as e:
+            logger.error(f"[RUGCHECK] Error: {e}")
+            return {"safe": False, "reason": str(e)}
 
 
     # ------------------------------------------------------------------

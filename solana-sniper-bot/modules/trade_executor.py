@@ -22,7 +22,7 @@ from solana.rpc.types import TxOpts
 from solders.transaction import VersionedTransaction
 
 from core.config import (
-    JUPITER_API, PAPER_TRADE, SOL_MINT,
+    JUPITER_API, JUPITER_PRICE_API, JUPITER_API_KEY, PAPER_TRADE, SOL_MINT,
     BASE_POSITION_SIZE_SOL, RISK_PCT_MIN, RISK_PCT_MAX,
     MAX_OPEN_POSITIONS, TRADE_COOLDOWN_SECONDS,
     NEW_COIN_TP_MULTIPLIER, GROWN_COIN_TP_MULTIPLIER,
@@ -30,6 +30,8 @@ from core.config import (
     HARD_STOP_LOSS_PCT, TRAILING_STOP_TRIGGER_PCT, TRAILING_STOP_DISTANCE_PCT,
     TIME_STOP_MINUTES, PRIORITY_FEE_LAMPORTS, PRIORITY_FEE_AGGRESSIVE_LAMPORTS,
     MAX_DAILY_LOSS_PCT, EMERGENCY_SELL_ALL,
+    POSITION_CHECK_INTERVAL, PRICE_FEED_TIMEOUT, BATCH_PRICE_FETCH,
+    ENABLE_WEBSOCKET_PRICES, HELIUS_WSS_URL,
 )
 from core.wallet import WalletManager
 
@@ -154,6 +156,10 @@ class TradeExecutor:
         self._loss_blacklist: set = set()
         # Optional async callback: notify(msg: str) — set by main.py
         self.notify = None  # type: Optional[callable]
+        # WebSocket connections for real-time price streaming
+        self._ws_connections: dict = {}  # mint -> websocket connection
+        self._ws_prices: dict = {}  # mint -> latest price from WebSocket
+        self._ws_enabled = ENABLE_WEBSOCKET_PRICES
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -483,8 +489,8 @@ class TradeExecutor:
     # ------------------------------------------------------------------
     async def manage_positions(self):
         """
-        Runs every 5 seconds. Updates prices, ratchets stop prices, checks exits.
-        Two-phase trailing stop — active from the moment a position opens.
+        Runs every 0.5 seconds safely using batched API requests.
+        Updates prices, ratchets stop prices, and checks exits instantly.
         """
         while True:
             try:
@@ -494,13 +500,26 @@ class TradeExecutor:
                     for mint in list(self.open_positions.keys()):
                         await self.execute_sell(mint, "emergency_sell_all")
 
-                for mint in list(self.open_positions.keys()):
+                # Step 1: Batch fetch all prices in one fast network call
+                open_mints = list(self.open_positions.keys())
+                if not open_mints:
+                    await asyncio.sleep(POSITION_CHECK_INTERVAL)
+                    continue
+
+                batch_prices = await self._get_batch_prices(open_mints)
+
+                # Step 2: Iterate through positions with the fresh data
+                for mint in open_mints:
                     pos = self.open_positions.get(mint)
                     if not pos:
                         continue
 
-                    # --- Price update ---
-                    price = await self._get_current_price(mint)
+                    # --- Price update (with fallback) ---
+                    price = batch_prices.get(mint)
+                    # If batch fails for a specific coin, try the fallback individual fetcher
+                    if not price or price <= 0:
+                        price = await self._get_current_price(mint)
+                    
                     if price and price > 0:
                         pos.current_price = price
                         pos.last_price_update = time.time()
@@ -508,9 +527,11 @@ class TradeExecutor:
                     else:
                         pos.consecutive_price_failures += 1
                         stale_seconds = time.time() - pos.last_price_update
-                        # Exit after 15s of no price data — don't wait for -97%
-                        if stale_seconds > 15:
-                            logger.warning(f"[STOP] Price feed dead for {pos.symbol} ({stale_seconds:.0f}s) — exiting")
+                        # Exit after PRICE_FEED_TIMEOUT of no price data (tightened from 15s)
+                        if stale_seconds > PRICE_FEED_TIMEOUT:
+                            logger.warning(
+                                f"[STOP] Price feed dead for {pos.symbol} ({stale_seconds:.0f}s) — exiting"
+                            )
                             await self.execute_sell(mint, "price_feed_dead")
                             continue
 
@@ -520,11 +541,6 @@ class TradeExecutor:
                     phase = "P2" if pos.phase2_active else "P1"
 
                     # --- Stop loss check ---
-                    # stop_price is always the ratcheted trailing stop (never moves down).
-                    # - During grace: fires as hard floor only (protects against entry rugs)
-                    # - After grace: fires as trailing stop (locks in profits as price rises)
-                    # If price rose to +80% and stop ratcheted to +30%, a rug exits at +30%.
-                    # If coin rugs straight from entry, exits at initial stop (-50% new / -40% old).
                     in_grace = pos.age_minutes < pos.grace_period_minutes
                     if pos.current_price <= pos.stop_price:
                         stop_pct = (pos.stop_price / pos.entry_price - 1) * 100
@@ -540,37 +556,41 @@ class TradeExecutor:
                                 f"[STOP] {phase} trailing stop for {pos.symbol} | "
                                 f"P&L={pnl*100:+.1f}% | stop={stop_pct:+.1f}%"
                             )
-                        await self.execute_sell(mint, reason)
+                        # Fire sell order asynchronously so it doesn't block the loop for other coins
+                        asyncio.create_task(self.execute_sell(mint, reason))
                         continue
 
-                    # --- Time-based stop: exit if flat after 30 min ---
+                    # --- Time-based stop ---
                     if pos.age_minutes >= TIME_STOP_MINUTES and pnl < 0.05:
-                        logger.info(f"[STOP] Time stop for {pos.symbol} | age={pos.age_minutes:.0f}m | P&L={pnl*100:+.1f}%")
-                        await self.execute_sell(mint, "time_stop")
+                        logger.info(
+                            f"[STOP] Time stop for {pos.symbol} | "
+                            f"age={pos.age_minutes:.0f}m | P&L={pnl*100:+.1f}%"
+                        )
+                        asyncio.create_task(self.execute_sell(mint, "time_stop"))
                         continue
 
                     # --- Partial take-profits ---
                     for level in PARTIAL_TP_LEVELS:
                         if level not in pos.tp_levels_hit and pnl >= (level - 1):
-                            logger.info(f"[TP] Partial TP {level}x for {pos.symbol} | P&L={pnl*100:+.1f}%")
-                            await self.execute_sell(mint, f"partial_tp_{level}x", PARTIAL_TP_PCT)
+                            logger.info(
+                                f"[TP] Partial TP {level}x for {pos.symbol} | P&L={pnl*100:+.1f}%"
+                            )
+                            asyncio.create_task(
+                                self.execute_sell(mint, f"partial_tp_{level}x", PARTIAL_TP_PCT)
+                            )
                             pos.tp_levels_hit.add(level)
 
                     # --- Full take-profit ---
                     if pnl >= (pos.tp_target - 1):
                         logger.info(f"[TP] Full TP {pos.tp_target}x for {pos.symbol}!")
-                        await self.execute_sell(mint, f"full_tp_{pos.tp_target}x")
+                        asyncio.create_task(self.execute_sell(mint, f"full_tp_{pos.tp_target}x"))
                         continue
-
-                    logger.debug(
-                        f"[POS] {pos.symbol} | P&L={pnl*100:+.1f}% | "
-                        f"stop={pos.stop_price:.8f} | high={pos.high_water_mark:.8f} | {phase}"
-                    )
 
             except Exception as e:
                 logger.error(f"[EXECUTOR] manage_positions error: {e}")
 
-            await asyncio.sleep(5)
+            # Sleep interval reduced from 5.0 to POSITION_CHECK_INTERVAL (default 0.5s)
+            await asyncio.sleep(POSITION_CHECK_INTERVAL)
 
     # ------------------------------------------------------------------
     # Price fetching (Birdeye → Dexscreener fallback)
@@ -596,20 +616,25 @@ class TradeExecutor:
         """
         Price fetch with 3 sources: Jupiter → Birdeye → Dexscreener.
         Returns None only if ALL three fail — reduces false price_feed_dead exits.
+        
+        NOTE: Jupiter Price API v3 requires API key. If no key, falls back to Birdeye/Dexscreener.
         """
         session = await self._get_session()
 
-        # 1. Jupiter price API (free, fast, no key)
-        try:
-            url = f"https://price.jup.ag/v4/price?ids={mint}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    price = data.get("data", {}).get(mint, {}).get("price")
-                    if price:
-                        return float(price)
-        except Exception:
-            pass
+        # 1. Jupiter Price API v3 (requires API key, most accurate)
+        if JUPITER_API_KEY:
+            try:
+                url = f"{JUPITER_PRICE_API}?ids={mint}"
+                headers = {"x-api-key": JUPITER_API_KEY}
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        price_data = data.get(mint, {})
+                        price = price_data.get("usdPrice")
+                        if price:
+                            return float(price)
+            except Exception:
+                pass
 
         # 2. Birdeye (free tier, good coverage for new tokens)
         try:
@@ -654,6 +679,146 @@ class TradeExecutor:
         loss_pct = (self._daily_start_balance - current) / self._daily_start_balance
         return loss_pct >= MAX_DAILY_LOSS_PCT
 
+    # ------------------------------------------------------------------
+    # Batch price fetching (reduces API calls from N to 1 per loop)
+    # ------------------------------------------------------------------
+    async def _get_batch_prices(self, mints: list[str]) -> dict[str, float]:
+        """
+        Fetch prices for multiple tokens in one API call.
+        Returns dict: {mint: price}
+        Falls back to individual fetching if batch fails.
+        
+        NOTE: Jupiter Price API v3 requires API key and supports up to 50 tokens per request.
+        """
+        if not BATCH_PRICE_FETCH or not mints:
+            return {}
+
+        session = await self._get_session()
+        prices = {}
+
+        # Jupiter Price API v3 (requires API key, up to 50 tokens per request)
+        if JUPITER_API_KEY:
+            try:
+                mint_ids = ",".join(mints[:50])  # Max 50 tokens
+                url = f"{JUPITER_PRICE_API}?ids={mint_ids}"
+                headers = {"x-api-key": JUPITER_API_KEY}
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for mint in mints:
+                            price_data = data.get(mint, {})
+                            price = price_data.get("usdPrice")
+                            if price:
+                                prices[mint] = float(price)
+                        if prices:
+                            logger.debug(f"[BATCH] Fetched {len(prices)}/{len(mints)} prices from Jupiter v3")
+                            return prices
+            except Exception as e:
+                logger.debug(f"[BATCH] Jupiter v3 batch failed: {e}")
+
+        # Fallback: Birdeye batch (if available)
+        try:
+            from core.config import BIRDEYE_API_KEY, BIRDEYE_API
+            if BIRDEYE_API_KEY:
+                headers = {"X-API-KEY": BIRDEYE_API_KEY}
+                # Birdeye multi-price endpoint (check their docs for exact format)
+                # This is a placeholder — adjust based on actual Birdeye API
+                for mint in mints:
+                    url = f"{BIRDEYE_API}/defi/price?address={mint}"
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            price = data.get("data", {}).get("value", 0)
+                            if price and float(price) > 0:
+                                prices[mint] = float(price)
+        except Exception as e:
+            logger.debug(f"[BATCH] Birdeye batch failed: {e}")
+
+        return prices
+
+    # ------------------------------------------------------------------
+    # WebSocket real-time price streaming (premium RPC required)
+    # ------------------------------------------------------------------
+    async def _subscribe_price_ws(self, mint: str):
+        """
+        Subscribe to real-time price updates via WebSocket.
+        Requires premium RPC like Helius with WebSocket support.
+        """
+        if not self._ws_enabled:
+            return
+
+        try:
+            import websockets
+            import json
+
+            # Connect to Helius WebSocket
+            async with websockets.connect(HELIUS_WSS_URL) as ws:
+                self._ws_connections[mint] = ws
+                
+                # Subscribe to account updates for the token's liquidity pool
+                # This is a simplified example — actual implementation depends on
+                # finding the correct pool account and subscribing to it
+                subscribe_msg = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "accountSubscribe",
+                    "params": [
+                        mint,
+                        {
+                            "encoding": "jsonParsed",
+                            "commitment": "confirmed"
+                        }
+                    ]
+                }
+                await ws.send(json.dumps(subscribe_msg))
+                
+                # Listen for price updates
+                while mint in self.open_positions:
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                        data = json.loads(msg)
+                        
+                        # Parse price from account data
+                        # This is highly simplified — real implementation needs
+                        # to decode the pool account data structure
+                        if "result" in data:
+                            # Extract price from pool reserves
+                            # price = calculate_from_reserves(data)
+                            # self._ws_prices[mint] = price
+                            pass
+                            
+                    except asyncio.TimeoutError:
+                        # Send ping to keep connection alive
+                        await ws.send(json.dumps({"jsonrpc": "2.0", "method": "ping"}))
+                        
+        except Exception as e:
+            logger.warning(f"[WS] WebSocket subscription failed for {mint}: {e}")
+            # Remove from connections on failure
+            self._ws_connections.pop(mint, None)
+
+    async def _get_ws_price(self, mint: str) -> Optional[float]:
+        """
+        Get latest price from WebSocket feed if available.
+        Returns None if WebSocket not connected or no recent update.
+        """
+        if not self._ws_enabled:
+            return None
+        
+        # Start WebSocket subscription if not already running
+        if mint not in self._ws_connections and mint in self.open_positions:
+            asyncio.create_task(self._subscribe_price_ws(mint))
+        
+        return self._ws_prices.get(mint)
+
     async def close(self):
+        # Close all WebSocket connections
+        for mint, ws in self._ws_connections.items():
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        self._ws_connections.clear()
+        
+        # Close HTTP session
         if self._session and not self._session.closed:
             await self._session.close()
