@@ -260,7 +260,8 @@ class TradeExecutor:
         Scale position size with balance and confidence.
         In paper mode, scales off simulated paper balance so sizing grows with profits.
         
-        NEW: Established coins get 1.5x larger position size (they're less risky).
+        IMPORTANT: Both new and established coins use THE SAME position size.
+        Established coins are proven and deserve equal or more capital allocation.
         """
         if PAPER_TRADE:
             # Use paper balance (real balance + accumulated paper P&L) for realistic scaling
@@ -279,13 +280,11 @@ class TradeExecutor:
 
         size = balance * risk_pct
         
-        # NEW: Established coins get 1.5x larger position (they're proven, less risky)
-        if not is_new_coin:
-            size *= 1.5
-            logger.debug(f"[SIZING] Established coin bonus: {size:.4f} SOL (1.5x multiplier)")
-
+        # SAME SIZE for both new and established coins
+        # No multiplier - they get equal treatment
+        
         size = max(size, BASE_POSITION_SIZE_SOL)
-        size = min(size, balance * RISK_PCT_MAX * 1.5)  # allow up to 45% for established coins
+        size = min(size, balance * RISK_PCT_MAX)  # never exceed max risk
         return round(size, 4)
 
     async def _paper_buy(self, mint: str, symbol: str, size_sol: float, is_new: bool, source: str = "unknown"):
